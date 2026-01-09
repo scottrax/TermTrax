@@ -1,0 +1,1066 @@
+#!/usr/bin/env bash
+# TermTrax: terminal-only SSH/serial manager for Linux/Mac/WSL.
+# Supports SSH (ssh, optional sshpass) and serial (screen preferred, or tio/picocom/minicom).
+# Optional encrypted password vault uses openssl. Detach/minimize uses screen.
+# Actively developed by https://github.com/scottrax
+# https://buymeacoffee.com/scottrax
+
+
+set -euo pipefail
+IFS=$'\n\t'
+
+APP_NAME="TermTrax"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/termtrax"
+DB_FILE="$CONFIG_DIR/connections.db"
+VAULT_FILE="$CONFIG_DIR/vault.enc"
+SETTINGS_FILE="$CONFIG_DIR/settings.conf"
+DB_HEADER="TERMTRAX_DB_V1"
+
+DEFAULT_BAUD="115200"
+VAULT_MASTER=""
+VAULT_ENABLED=1
+VAULT_WARNED=0
+
+print_help() {
+  cat <<'EOF'
+TermTrax: terminal-only SSH/serial manager.
+
+Usage:
+  termtrax [--help]
+
+What it does:
+  - Manage SSH and serial connections with a text menu.
+  - Optionally store SSH passwords in an encrypted vault.
+  - Detach/minimize sessions when GNU screen is available.
+
+Exit/minimize:
+  - SSH: type 'exit' or Ctrl+D to return.
+  - SSH (screen): Ctrl+A, D to detach; reattach via TermTrax.
+  - Serial (screen): Ctrl+A, D to detach; Ctrl+A, K to kill.
+  - Serial (picocom): Ctrl+A, Ctrl+X to exit.
+  - Serial (tio): Ctrl+T then Q to exit.
+  - Serial (minicom): Ctrl+A, Z then X to exit.
+
+Dependencies:
+  - Required: bash, ssh
+  - Optional: openssl (vault), screen (detach/reattach), sshpass, tio/picocom/minicom
+
+Config:
+  - Connections: ~/.config/termtrax/connections.db
+  - Vault: ~/.config/termtrax/vault.enc
+  - Settings: ~/.config/termtrax/settings.conf
+EOF
+}
+
+clear_screen() {
+  if command -v clear >/dev/null 2>&1; then
+    clear
+  else
+    printf '\n\n\n'
+  fi
+}
+
+print_header() {
+  printf '=== %s ===\n' "$1"
+}
+
+pause() {
+  local _
+  read -r -p "Press Enter to continue..." _ || true
+}
+
+sanitize_field() {
+  local value="$1"
+  value="${value//$'\n'/ }"
+  value="${value//|/}"
+  printf '%s' "$value"
+}
+
+expand_path() {
+  local path="$1"
+  if [[ "$path" == "~/"* ]]; then
+    printf '%s' "$HOME/${path#~/}"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+ensure_config_dir() {
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+}
+
+config_init() {
+  if [[ ! -f "$DB_FILE" ]]; then
+    ensure_config_dir
+    printf '%s\n' "$DB_HEADER" > "$DB_FILE"
+    chmod 600 "$DB_FILE"
+  fi
+}
+
+load_settings() {
+  if [[ -f "$SETTINGS_FILE" ]]; then
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      IFS='=' read -r key value <<< "$line"
+      case "$key" in
+        DEFAULT_BAUD) DEFAULT_BAUD="$value" ;;
+      esac
+    done < "$SETTINGS_FILE"
+  fi
+}
+
+save_settings() {
+  ensure_config_dir
+  local tmp
+  tmp="$(mktemp "${SETTINGS_FILE}.tmp.XXXX")"
+  {
+    printf '%s\n' "# TermTrax settings"
+    printf 'DEFAULT_BAUD=%s\n' "$DEFAULT_BAUD"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$SETTINGS_FILE"
+}
+
+prompt_input() {
+  local prompt="$1"
+  local default="${2-}"
+  local value=""
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " value || true
+    value="${value:-$default}"
+  else
+    read -r -p "$prompt: " value || true
+  fi
+  printf '%s' "$value"
+}
+
+prompt_input_allow_clear() {
+  local prompt="$1"
+  local default="${2-}"
+  local value
+  value="$(prompt_input "$prompt (use '-' to clear)" "$default")"
+  if [[ "$value" == "-" ]]; then
+    value=""
+  fi
+  printf '%s' "$value"
+}
+
+prompt_required() {
+  local prompt="$1"
+  local value=""
+  while [[ -z "$value" ]]; do
+    read -r -p "$prompt: " value || true
+    if [[ -z "$value" ]]; then
+      echo "Value required."
+    fi
+  done
+  printf '%s' "$value"
+}
+
+confirm_yes_no() {
+  local prompt="$1"
+  local default="${2:-n}"
+  local choice=""
+  while true; do
+    read -r -p "$prompt [y/n]: " choice || true
+    choice="${choice:-$default}"
+    case "$choice" in
+      y|Y) return 0 ;;
+      n|N) return 1 ;;
+      *) echo "Please enter y or n." ;;
+    esac
+  done
+}
+
+prompt_auth_type() {
+  local current="${1-}"
+  local choice=""
+  while true; do
+    printf '%s\n' "Auth type: [1] key  [2] password  [3] agent" >&2
+    read -r -p "Select auth type${current:+ (Enter to keep $current)}: " choice || true
+    if [[ -z "$choice" && -n "$current" ]]; then
+      printf '%s' "$current"
+      return 0
+    fi
+    case "$choice" in
+      1|key) printf 'key'; return 0 ;;
+      2|password) printf 'password'; return 0 ;;
+      3|agent) printf 'agent'; return 0 ;;
+      *) printf '%s\n' "Invalid selection." >&2 ;;
+    esac
+  done
+}
+
+prompt_connection_type() {
+  local current="${1-}"
+  local choice=""
+  while true; do
+    printf '%s\n' "Type: [1] ssh  [2] serial" >&2
+    read -r -p "Select type${current:+ (Enter to keep $current)}: " choice || true
+    if [[ -z "$choice" && -n "$current" ]]; then
+      printf '%s' "$current"
+      return 0
+    fi
+    case "$choice" in
+      1|ssh) printf 'ssh'; return 0 ;;
+      2|serial) printf 'serial'; return 0 ;;
+      *) printf '%s\n' "Invalid selection." >&2 ;;
+    esac
+  done
+}
+
+load_connections() {
+  config_init
+  CONNECTION_LINES=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == "$DB_HEADER" || "$line" == \#* ]] && continue
+    CONNECTION_LINES+=("$line")
+  done < "$DB_FILE"
+}
+
+save_connections() {
+  ensure_config_dir
+  local tmp
+  tmp="$(mktemp "${DB_FILE}.tmp.XXXX")"
+  {
+    printf '%s\n' "$DB_HEADER"
+    for line in "${CONNECTION_LINES[@]}"; do
+      printf '%s\n' "$line"
+    done
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$DB_FILE"
+}
+
+get_next_id() {
+  local max=0
+  local line id
+  for line in "${CONNECTION_LINES[@]}"; do
+    IFS='|' read -r id _ <<< "$line"
+    if [[ "$id" =~ ^[0-9]+$ ]] && (( id > max )); then
+      max="$id"
+    fi
+  done
+  printf '%s' "$((max + 1))"
+}
+
+find_connection_index_by_id() {
+  local target="$1"
+  local idx=0 line id
+  for line in "${CONNECTION_LINES[@]}"; do
+    IFS='|' read -r id _ <<< "$line"
+    if [[ "$id" == "$target" ]]; then
+      printf '%s' "$idx"
+      return 0
+    fi
+    idx=$((idx + 1))
+  done
+  return 1
+}
+
+format_connection() {
+  local line="$1"
+  local id type name user host port auth_type key_path serial_dev baud parity databits stopbits tags
+  IFS='|' read -r id type name user host port auth_type key_path serial_dev baud parity databits stopbits tags <<< "$line"
+  local summary=""
+  if [[ "$type" == "ssh" ]]; then
+    port="${port:-22}"
+    summary="ssh: ${user}@${host}:${port}, ${auth_type}"
+  else
+    baud="${baud:-$DEFAULT_BAUD}"
+    summary="serial: ${serial_dev} @${baud}"
+  fi
+  if [[ -n "${tags-}" ]]; then
+    summary="${summary} - ${tags}"
+  fi
+  printf '[%s] %s (%s)\n' "$id" "$name" "$summary"
+}
+
+list_connections() {
+  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
+    echo "No connections defined."
+    return 0
+  fi
+  local line
+  for line in "${CONNECTION_LINES[@]}"; do
+    format_connection "$line"
+  done
+}
+
+vault_require_openssl() {
+  if ! command -v openssl >/dev/null 2>&1; then
+    VAULT_ENABLED=0
+    if [[ "$VAULT_WARNED" -eq 0 ]]; then
+      echo "OpenSSL not found. Vault features are disabled."
+      VAULT_WARNED=1
+    fi
+    return 1
+  fi
+  return 0
+}
+
+vault_init() {
+  if [[ -f "$VAULT_FILE" ]]; then
+    return 0
+  fi
+  vault_require_openssl || return 1
+  ensure_config_dir
+  echo "No vault found. Create a new master password."
+  local pw1 pw2
+  while true; do
+    read -rs -p "Create master password: " pw1 || true
+    echo
+    read -rs -p "Confirm master password: " pw2 || true
+    echo
+    if [[ -z "$pw1" ]]; then
+      echo "Master password cannot be empty."
+      continue
+    fi
+    if [[ "$pw1" != "$pw2" ]]; then
+      echo "Passwords do not match."
+      continue
+    fi
+    VAULT_MASTER="$pw1"
+    break
+  done
+  vault_write_data ""
+}
+
+vault_write_data() {
+  local data="$1"
+  vault_require_openssl || return 1
+  ensure_config_dir
+  local tmp
+  tmp="$(mktemp "${VAULT_FILE}.tmp.XXXX")"
+  printf '%s' "$data" | openssl enc -aes-256-cbc -md sha512 -a -pbkdf2 -iter 100000 -salt \
+    -pass pass:"$VAULT_MASTER" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$VAULT_FILE"
+}
+
+vault_read_data() {
+  vault_require_openssl || return 1
+  if [[ ! -f "$VAULT_FILE" ]]; then
+    return 1
+  fi
+  local data
+  if ! data="$(openssl enc -d -aes-256-cbc -md sha512 -a -pbkdf2 -iter 100000 -salt \
+    -pass pass:"$VAULT_MASTER" -in "$VAULT_FILE" 2>/dev/null)"; then
+    echo "Vault: wrong master password."
+    VAULT_MASTER=""
+    return 1
+  fi
+  printf '%s' "$data"
+}
+
+vault_require_master() {
+  vault_require_openssl || return 1
+  if [[ -z "$VAULT_MASTER" ]]; then
+    read -rs -p "Master password: " VAULT_MASTER || true
+    echo
+  fi
+  return 0
+}
+
+vault_set() {
+  local key="$1"
+  local password="$2"
+  vault_require_openssl || return 1
+  vault_init || return 1
+  vault_require_master || return 1
+  if [[ "$password" == *"|"* ]]; then
+    echo "Password contains '|', which is not supported."
+    return 1
+  fi
+  local data line new_data=""
+  if ! data="$(vault_read_data)"; then
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" != "$key|"* ]]; then
+      new_data+="${line}"$'\n'
+    fi
+  done <<< "$data"
+  new_data+="${key}|${password}"
+  vault_write_data "$new_data"
+}
+
+vault_get() {
+  local key="$1"
+  vault_require_openssl || return 1
+  if [[ ! -f "$VAULT_FILE" ]]; then
+    return 1
+  fi
+  vault_require_master || return 1
+  local data line id pass
+  data="$(vault_read_data)" || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    IFS='|' read -r id pass <<< "$line"
+    if [[ "$id" == "$key" ]]; then
+      printf '%s' "$pass"
+      return 0
+    fi
+  done <<< "$data"
+  return 1
+}
+
+vault_delete() {
+  local key="$1"
+  vault_require_openssl || return 0
+  if [[ ! -f "$VAULT_FILE" ]]; then
+    return 0
+  fi
+  vault_require_master || return 0
+  local data line new_data=""
+  if ! data="$(vault_read_data)"; then
+    return 1
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" != "$key|"* ]]; then
+      new_data+="${line}"$'\n'
+    fi
+  done <<< "$data"
+  new_data="${new_data%$'\n'}"
+  vault_write_data "$new_data"
+}
+
+reset_vault() {
+  if [[ ! -f "$VAULT_FILE" ]]; then
+    echo "Vault not found."
+    return 0
+  fi
+  if ! confirm_yes_no "Really reset and delete the vault?" "n"; then
+    return 0
+  fi
+  if command -v shred >/dev/null 2>&1; then
+    shred -u "$VAULT_FILE"
+  else
+    rm -f "$VAULT_FILE"
+  fi
+  VAULT_MASTER=""
+  echo "Vault reset."
+}
+
+connection_add() {
+  clear_screen
+  print_header "TermTrax: Add Connection"
+  load_connections
+  local id type name user host port auth_type key_path serial_dev baud parity databits stopbits tags
+  id="$(get_next_id)"
+  type="$(prompt_connection_type "")"
+  name="$(prompt_required "Name")"
+  name="$(sanitize_field "$name")"
+  if [[ "$type" == "ssh" ]]; then
+    user="$(prompt_required "Username")"
+    user="$(sanitize_field "$user")"
+    host="$(prompt_required "Hostname/IP")"
+    host="$(sanitize_field "$host")"
+    port="$(prompt_input "Port" "22")"
+    auth_type="$(prompt_auth_type "key")"
+    if [[ "$auth_type" == "key" ]]; then
+      key_path="$(prompt_input_allow_clear "Key path" "~/.ssh/id_rsa")"
+      key_path="$(sanitize_field "$key_path")"
+    elif [[ "$auth_type" == "password" ]]; then
+      if vault_require_openssl; then
+        if confirm_yes_no "Store password in vault?" "y"; then
+          local pw
+          read -rs -p "SSH password: " pw || true
+          echo
+          if [[ -n "$pw" ]]; then
+            vault_set "$id" "$pw" || echo "Failed to store password."
+          fi
+          unset pw
+        fi
+      else
+        echo "Vault disabled; password will not be stored."
+      fi
+    fi
+    tags="$(prompt_input_allow_clear "Notes/tags" "")"
+    tags="$(sanitize_field "$tags")"
+  else
+    serial_dev="$(prompt_required "Device path")"
+    serial_dev="$(sanitize_field "$serial_dev")"
+    baud="$(prompt_input "Baud rate" "$DEFAULT_BAUD")"
+    parity="$(prompt_input_allow_clear "Parity (N/E/O or blank)" "")"
+    databits="$(prompt_input_allow_clear "Data bits (5-8 or blank)" "")"
+    stopbits="$(prompt_input_allow_clear "Stop bits (1/2 or blank)" "")"
+    tags="$(prompt_input_allow_clear "Notes/tags" "")"
+    tags="$(sanitize_field "$tags")"
+  fi
+  local line
+  line="${id}|${type}|${name}|${user-}|${host-}|${port-}|${auth_type-}|${key_path-}|${serial_dev-}|${baud-}|${parity-}|${databits-}|${stopbits-}|${tags-}"
+  CONNECTION_LINES+=("$line")
+  save_connections
+  echo "Added connection [$id] $name."
+  pause
+}
+
+connection_edit() {
+  clear_screen
+  print_header "TermTrax: Edit Connection"
+  load_connections
+  list_connections
+  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
+    pause
+    return 0
+  fi
+  local id
+  id="$(prompt_required "Enter ID to edit")"
+  local idx
+  if ! idx="$(find_connection_index_by_id "$id")"; then
+    echo "Connection ID not found."
+    pause
+    return 0
+  fi
+  local line
+  line="${CONNECTION_LINES[$idx]}"
+  local type name user host port auth_type key_path serial_dev baud parity databits stopbits tags
+  IFS='|' read -r _ type name user host port auth_type key_path serial_dev baud parity databits stopbits tags <<< "$line"
+  local old_auth_type="$auth_type"
+  type="$(prompt_connection_type "$type")"
+  name="$(prompt_input "Name" "$name")"
+  name="$(sanitize_field "$name")"
+  if [[ "$type" == "ssh" ]]; then
+    user="$(prompt_input "Username" "$user")"
+    user="$(sanitize_field "$user")"
+    host="$(prompt_input "Hostname/IP" "$host")"
+    host="$(sanitize_field "$host")"
+    port="$(prompt_input "Port" "${port:-22}")"
+    auth_type="$(prompt_auth_type "$auth_type")"
+    if [[ "$auth_type" == "key" ]]; then
+      key_path="$(prompt_input_allow_clear "Key path" "${key_path:-~/.ssh/id_rsa}")"
+      key_path="$(sanitize_field "$key_path")"
+      if [[ "$old_auth_type" == "password" ]]; then
+        vault_delete "$id" || true
+      fi
+    elif [[ "$auth_type" == "password" ]]; then
+      if vault_require_openssl; then
+        if confirm_yes_no "Update stored password?" "n"; then
+          local pw
+          read -rs -p "SSH password: " pw || true
+          echo
+          if [[ -n "$pw" ]]; then
+            vault_set "$id" "$pw" || echo "Failed to store password."
+          fi
+          unset pw
+        fi
+      else
+        echo "Vault disabled; password will not be stored."
+      fi
+      key_path=""
+    else
+      key_path=""
+      if [[ "$old_auth_type" == "password" ]]; then
+        vault_delete "$id" || true
+      fi
+    fi
+    tags="$(prompt_input_allow_clear "Notes/tags" "$tags")"
+    tags="$(sanitize_field "$tags")"
+    serial_dev=""
+    baud=""
+    parity=""
+    databits=""
+    stopbits=""
+  else
+    serial_dev="$(prompt_input "Device path" "$serial_dev")"
+    serial_dev="$(sanitize_field "$serial_dev")"
+    baud="$(prompt_input "Baud rate" "${baud:-$DEFAULT_BAUD}")"
+    parity="$(prompt_input_allow_clear "Parity (N/E/O or blank)" "$parity")"
+    databits="$(prompt_input_allow_clear "Data bits (5-8 or blank)" "$databits")"
+    stopbits="$(prompt_input_allow_clear "Stop bits (1/2 or blank)" "$stopbits")"
+    tags="$(prompt_input_allow_clear "Notes/tags" "$tags")"
+    tags="$(sanitize_field "$tags")"
+    user=""
+    host=""
+    port=""
+    auth_type=""
+    key_path=""
+    if [[ "$old_auth_type" == "password" ]]; then
+      vault_delete "$id" || true
+    fi
+  fi
+  CONNECTION_LINES[$idx]="${id}|${type}|${name}|${user-}|${host-}|${port-}|${auth_type-}|${key_path-}|${serial_dev-}|${baud-}|${parity-}|${databits-}|${stopbits-}|${tags-}"
+  save_connections
+  echo "Updated connection [$id] $name."
+  pause
+}
+
+connection_delete() {
+  clear_screen
+  print_header "TermTrax: Delete Connection"
+  load_connections
+  list_connections
+  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
+    pause
+    return 0
+  fi
+  local id
+  id="$(prompt_required "Enter ID to delete")"
+  local idx
+  if ! idx="$(find_connection_index_by_id "$id")"; then
+    echo "Connection ID not found."
+    pause
+    return 0
+  fi
+  local line type auth_type
+  line="${CONNECTION_LINES[$idx]}"
+  IFS='|' read -r _ type _ _ _ _ auth_type _ _ _ _ _ _ _ <<< "$line"
+  if ! confirm_yes_no "Delete connection ID $id?" "n"; then
+    return 0
+  fi
+  unset 'CONNECTION_LINES[idx]'
+  CONNECTION_LINES=("${CONNECTION_LINES[@]}")
+  save_connections
+  if [[ "$auth_type" == "password" ]]; then
+    vault_delete "$id" || true
+  fi
+  echo "Deleted connection [$id]."
+  pause
+}
+
+run_interactive() {
+  set +e
+  "$@"
+  local rc=$?
+  set -e
+  return $rc
+}
+
+build_ssh_command() {
+  local user="$1"
+  local host="$2"
+  local port="$3"
+  local auth_type="$4"
+  local key_path="$5"
+  port="${port:-22}"
+  SSH_CMD=("ssh" "-p" "$port")
+  if [[ "$auth_type" == "key" && -n "$key_path" ]]; then
+    SSH_CMD+=("-i" "$key_path")
+  fi
+  SSH_CMD+=("${user}@${host}")
+}
+
+ssh_connect() {
+  local id="$1" name="$2" user="$3" host="$4" port="$5" auth_type="$6" key_path="$7"
+  if ! command -v ssh >/dev/null 2>&1; then
+    echo "ssh not found."
+    pause
+    return 0
+  fi
+  local key_path_expanded=""
+  if [[ -n "$key_path" ]]; then
+    key_path_expanded="$(expand_path "$key_path")"
+  fi
+  build_ssh_command "$user" "$host" "$port" "$auth_type" "$key_path_expanded"
+  local -a cmd=("${SSH_CMD[@]}")
+
+  clear_screen
+  print_header "TermTrax: SSH Connect"
+  echo "Connecting to: $name"
+  echo "Command: ${cmd[*]}"
+  echo "Tip: type 'exit' or press Ctrl+D to return to TermTrax."
+  echo "SSH escape: use ~. to terminate the session."
+
+  local use_screen=0
+  if command -v screen >/dev/null 2>&1; then
+    use_screen=1
+    echo "Screen detach: Ctrl+A, D (session keeps running)."
+  fi
+
+  local password=""
+  local use_sshpass=0
+  if [[ "$auth_type" == "password" ]]; then
+    if command -v sshpass >/dev/null 2>&1; then
+      if password="$(vault_get "$id" 2>/dev/null)"; then
+        use_sshpass=1
+      else
+        echo "No stored password. You will be prompted by ssh."
+      fi
+    else
+      echo "sshpass not found. You will be prompted by ssh."
+    fi
+  fi
+
+  echo
+  if [[ "$use_screen" -eq 1 ]]; then
+    local session="termtrax-${id}-ssh"
+    if [[ "$use_sshpass" -eq 1 ]]; then
+      run_interactive screen -S "$session" sshpass -p "$password" "${cmd[@]}"
+    else
+      run_interactive screen -S "$session" "${cmd[@]}"
+    fi
+  else
+    if [[ "$use_sshpass" -eq 1 ]]; then
+      run_interactive sshpass -p "$password" "${cmd[@]}"
+    else
+      run_interactive "${cmd[@]}"
+    fi
+  fi
+  unset password
+  echo "SSH session ended."
+  pause
+}
+
+configure_serial_line() {
+  local dev="$1" baud="$2" parity="$3" databits="$4" stopbits="$5"
+  if ! command -v stty >/dev/null 2>&1; then
+    return 0
+  fi
+  local -a stty_args=()
+  stty_args+=("$baud")
+  case "${databits:-}" in
+    5) stty_args+=("cs5") ;;
+    6) stty_args+=("cs6") ;;
+    7) stty_args+=("cs7") ;;
+    8|"") stty_args+=("cs8") ;;
+  esac
+  case "${stopbits:-}" in
+    2) stty_args+=("cstopb") ;;
+    1|"") stty_args+=("-cstopb") ;;
+  esac
+  case "${parity:-}" in
+    E|e) stty_args+=("parenb" "-parodd") ;;
+    O|o) stty_args+=("parenb" "parodd") ;;
+    N|n|"") stty_args+=("-parenb") ;;
+  esac
+  set +e
+  stty -F "$dev" "${stty_args[@]}" 2>/dev/null
+  set -e
+}
+
+serial_tool_detect() {
+  if command -v screen >/dev/null 2>&1; then
+    echo "screen"
+  elif command -v tio >/dev/null 2>&1; then
+    echo "tio"
+  elif command -v picocom >/dev/null 2>&1; then
+    echo "picocom"
+  elif command -v minicom >/dev/null 2>&1; then
+    echo "minicom"
+  else
+    echo ""
+  fi
+}
+
+serial_connect() {
+  local id="$1" name="$2" serial_dev="$3" baud="$4" parity="$5" databits="$6" stopbits="$7"
+  local tool
+  tool="$(serial_tool_detect)"
+  if [[ -z "$tool" ]]; then
+    echo "No serial tool found (screen/tio/picocom/minicom)."
+    pause
+    return 0
+  fi
+  baud="${baud:-$DEFAULT_BAUD}"
+  configure_serial_line "$serial_dev" "$baud" "$parity" "$databits" "$stopbits"
+
+  clear_screen
+  print_header "TermTrax: Serial Connect"
+  echo "Connecting to: $name"
+  case "$tool" in
+    screen)
+      echo "Command: screen $serial_dev $baud"
+      echo "Exit: Ctrl+A, K"
+      echo "Detach: Ctrl+A, D (session keeps running)."
+      ;;
+    tio)
+      echo "Command: tio -b $baud $serial_dev"
+      echo "Exit: Ctrl+T then Q"
+      ;;
+    picocom)
+      echo "Command: picocom -b $baud $serial_dev"
+      echo "Exit: Ctrl+A then Ctrl+X"
+      ;;
+    minicom)
+      echo "Command: minicom -b $baud -D $serial_dev"
+      echo "Exit: Ctrl+A then Z then X"
+      ;;
+  esac
+  echo
+
+  if [[ "$tool" == "screen" ]]; then
+    local session="termtrax-${id}-serial"
+    run_interactive screen -S "$session" "$serial_dev" "$baud"
+  elif [[ "$tool" == "tio" ]]; then
+    run_interactive tio -b "$baud" "$serial_dev"
+  elif [[ "$tool" == "picocom" ]]; then
+    run_interactive picocom -b "$baud" "$serial_dev"
+  else
+    run_interactive minicom -b "$baud" -D "$serial_dev"
+  fi
+  echo "Serial session ended."
+  pause
+}
+
+connection_connect() {
+  clear_screen
+  print_header "TermTrax: Connect"
+  load_connections
+  list_connections
+  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
+    pause
+    return 0
+  fi
+  local id
+  id="$(prompt_required "Enter ID to connect")"
+  local idx
+  if ! idx="$(find_connection_index_by_id "$id")"; then
+    echo "Connection ID not found."
+    pause
+    return 0
+  fi
+  local line
+  line="${CONNECTION_LINES[$idx]}"
+  local type name user host port auth_type key_path serial_dev baud parity databits stopbits
+  IFS='|' read -r _ type name user host port auth_type key_path serial_dev baud parity databits stopbits _ <<< "$line"
+  if [[ "$type" == "ssh" ]]; then
+    ssh_connect "$id" "$name" "$user" "$host" "$port" "$auth_type" "$key_path"
+  else
+    serial_connect "$id" "$name" "$serial_dev" "$baud" "$parity" "$databits" "$stopbits"
+  fi
+}
+
+export_config() {
+  clear_screen
+  print_header "TermTrax: Export Config"
+  config_init
+  local path
+  path="$(prompt_input "Export path" "./termtrax-connections.db")"
+  if [[ -z "$path" ]]; then
+    echo "No path provided."
+    pause
+    return 0
+  fi
+  if [[ -f "$path" ]]; then
+    if ! confirm_yes_no "File exists. Overwrite?" "n"; then
+      return 0
+    fi
+  fi
+  cp -- "$DB_FILE" "$path"
+  echo "Exported to $path."
+  pause
+}
+
+import_config() {
+  clear_screen
+  print_header "TermTrax: Import Config"
+  local path
+  path="$(prompt_required "Import path")"
+  if [[ ! -f "$path" ]]; then
+    echo "File not found."
+    pause
+    return 0
+  fi
+  local header
+  header="$(head -n 1 "$path" 2>/dev/null || true)"
+  if [[ "$header" != "$DB_HEADER" ]]; then
+    echo "Warning: header mismatch (expected $DB_HEADER)."
+    if ! confirm_yes_no "Import anyway?" "n"; then
+      return 0
+    fi
+  fi
+  if ! confirm_yes_no "Overwrite current connections?" "n"; then
+    return 0
+  fi
+  ensure_config_dir
+  local tmp
+  tmp="$(mktemp "${DB_FILE}.tmp.XXXX")"
+  cp -- "$path" "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$DB_FILE"
+  echo "Import complete."
+  pause
+}
+
+export_import_menu() {
+  while true; do
+    clear_screen
+    print_header "TermTrax: Export/Import"
+    echo "1) Export config"
+    echo "2) Import config"
+    echo "3) Back"
+    local choice
+    read -r -p "Select option: " choice || true
+    case "$choice" in
+      1) export_config ;;
+      2) import_config ;;
+      3) return 0 ;;
+      *) echo "Invalid selection."; pause ;;
+    esac
+  done
+}
+
+screen_sessions_menu() {
+  local filter="$1"
+  if ! command -v screen >/dev/null 2>&1; then
+    echo "screen not found."
+    pause
+    return 0
+  fi
+  local sessions=()
+  local s
+  mapfile -t sessions < <(screen -ls 2>/dev/null | awk '/termtrax-/{print $1}' || true)
+  local filtered=()
+  for s in "${sessions[@]}"; do
+    case "$filter" in
+      ssh)
+        [[ "$s" == *"-ssh" ]] || continue
+        ;;
+      serial)
+        [[ "$s" == *"-serial" ]] || continue
+        ;;
+    esac
+    filtered+=("$s")
+  done
+  clear_screen
+  case "$filter" in
+    ssh) print_header "TermTrax: SSH Screen Sessions" ;;
+    serial) print_header "TermTrax: Serial Screen Sessions" ;;
+    *) print_header "TermTrax: Screen Sessions" ;;
+  esac
+  if [[ "${#filtered[@]}" -eq 0 ]]; then
+    echo "No matching screen sessions found."
+    pause
+    return 0
+  fi
+  local idx=1
+  for s in "${filtered[@]}"; do
+    echo "[$idx] $s"
+    idx=$((idx + 1))
+  done
+  echo "[0] Back"
+  local choice
+  read -r -p "Select session to attach: " choice || true
+  if [[ "$choice" == "0" || -z "$choice" ]]; then
+    return 0
+  fi
+  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#filtered[@]} )); then
+    local session="${filtered[$((choice - 1))]}"
+    run_interactive screen -r "$session"
+  else
+    echo "Invalid selection."
+    pause
+  fi
+}
+
+reattach_menu() {
+  while true; do
+    clear_screen
+    print_header "TermTrax: Reattach Sessions"
+    echo "1) SSH screen sessions"
+    echo "2) Serial screen sessions"
+    echo "3) All TermTrax screen sessions"
+    echo "4) Back"
+    local choice
+    read -r -p "Select option: " choice || true
+    case "$choice" in
+      1) screen_sessions_menu "ssh" ;;
+      2) screen_sessions_menu "serial" ;;
+      3) screen_sessions_menu "all" ;;
+      4) return 0 ;;
+      *) echo "Invalid selection."; pause ;;
+    esac
+  done
+}
+
+settings_menu() {
+  while true; do
+    clear_screen
+    print_header "TermTrax: Settings"
+    echo "1) Set default serial baud (current: $DEFAULT_BAUD)"
+    echo "2) Reset vault"
+    echo "3) Reattach sessions"
+    echo "4) Back"
+    local choice
+    read -r -p "Select option: " choice || true
+    case "$choice" in
+      1)
+        local baud
+        baud="$(prompt_required "Default baud rate")"
+        DEFAULT_BAUD="$baud"
+        save_settings
+        echo "Default baud set to $DEFAULT_BAUD."
+        pause
+        ;;
+      2)
+        reset_vault
+        pause
+        ;;
+      3)
+        reattach_menu
+        ;;
+      4) return 0 ;;
+      *) echo "Invalid selection."; pause ;;
+    esac
+  done
+}
+
+connection_list_menu() {
+  clear_screen
+  print_header "TermTrax: Connections"
+  load_connections
+  list_connections
+  pause
+}
+
+main_menu() {
+  while true; do
+    clear_screen
+    print_header "$APP_NAME"
+    echo "1) List connections"
+    echo "2) Add connection"
+    echo "3) Edit connection"
+    echo "4) Delete connection"
+    echo "5) Connect"
+    echo "6) Export/import config"
+    echo "7) Settings"
+    echo "8) Quit"
+    local choice
+    read -r -p "Select option: " choice || true
+    case "$choice" in
+      1) connection_list_menu ;;
+      2) connection_add ;;
+      3) connection_edit ;;
+      4) connection_delete ;;
+      5) connection_connect ;;
+      6) export_import_menu ;;
+      7) settings_menu ;;
+      8) echo "Goodbye."; exit 0 ;;
+      *) echo "Invalid selection."; pause ;;
+    esac
+  done
+}
+
+main() {
+  if [[ "${1-}" == "--help" || "${1-}" == "-h" ]]; then
+    print_help
+    exit 0
+  fi
+  if ! command -v ssh >/dev/null 2>&1; then
+    echo "Warning: ssh not found. SSH connections will not work."
+  fi
+  if ! command -v openssl >/dev/null 2>&1; then
+    VAULT_ENABLED=0
+  fi
+  ensure_config_dir
+  load_settings
+  config_init
+  main_menu
+}
+
+main "$@"
+
+# Install:
+#   chmod +x termtrax
+#   mv termtrax ~/bin/termtrax  (or /usr/local/bin/termtrax)
+#
+# Examples:
+#   termtrax
+#   Add SSH: Name=web01, Host=10.0.0.5, User=pi, Port=22, Auth=key
+#   Add serial: Name=router-console, Device=/dev/ttyUSB0, Baud=115200
+#   Detach screen: Ctrl+A, D then reattach via Settings -> Reattach sessions
