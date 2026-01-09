@@ -1,1066 +1,1666 @@
 #!/usr/bin/env bash
-# TermTrax: terminal-only SSH/serial manager for Linux/Mac/WSL.
-# Supports SSH (ssh, optional sshpass) and serial (screen preferred, or tio/picocom/minicom).
-# Optional encrypted password vault uses openssl. Detach/minimize uses screen.
-# Actively developed by https://github.com/scottrax
-# https://buymeacoffee.com/scottrax
+#═══════════════════════════════════════════════════════════════════════════════
+#  TermTrax v3.0 - Terminal Connection Manager
+#  A Termius-style SSH/Serial manager with full encryption at rest
+#
+#  Features:
+#    - Arrow key navigation with Enter to select
+#    - Full database encryption (AES-256)
+#    - Persistent login sessions (machine-bound token)
+#    - Identity profiles (reusable credentials)
+#    - Folder organization for connections
+#
+#  Dependencies:
+#    Required: bash 4.0+, ssh, openssl
+#    Optional: screen (session detach), sshpass, tio/picocom/minicom (serial)
+#═══════════════════════════════════════════════════════════════════════════════
 
+set -o pipefail
 
-set -euo pipefail
-IFS=$'\n\t'
+readonly VERSION="3.0.0"
+readonly APP_NAME="TermTrax"
+readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/termtrax"
+readonly DB_FILE="$CONFIG_DIR/data.enc"
+readonly SESSION_FILE="${XDG_RUNTIME_DIR:-/tmp}/termtrax-${UID}.session"
+readonly MACHINE_ID_FILE="/etc/machine-id"
 
-APP_NAME="TermTrax"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/termtrax"
-DB_FILE="$CONFIG_DIR/connections.db"
-VAULT_FILE="$CONFIG_DIR/vault.enc"
-SETTINGS_FILE="$CONFIG_DIR/settings.conf"
-DB_HEADER="TERMTRAX_DB_V1"
+# Runtime state
+declare -A DATA=()          # Main encrypted data store
+declare -a MENU_ITEMS=()    # Current menu items
+declare -a MENU_IDS=()      # IDs for menu items
+MENU_SELECTED=0             # Currently selected index
+CURRENT_FOLDER=""           # Current folder path
+VAULT_MASTER=""             # Master password (in memory only)
+SESSION_KEY=""              # Derived session key
 
-DEFAULT_BAUD="115200"
-VAULT_MASTER=""
-VAULT_ENABLED=1
-VAULT_WARNED=0
+# Feature detection
+HAS_SCREEN=0
+HAS_SSHPASS=0
+SERIAL_TOOL=""
 
-print_help() {
-  cat <<'EOF'
-TermTrax: terminal-only SSH/serial manager.
+# Terminal state
+TERM_ROWS=24
+TERM_COLS=80
 
-Usage:
-  termtrax [--help]
+# Colors & Styles
+readonly RST=$'\033[0m'
+readonly BOLD=$'\033[1m'
+readonly DIM=$'\033[2m'
+readonly ITALIC=$'\033[3m'
+readonly ULINE=$'\033[4m'
+readonly BLINK=$'\033[5m'
+readonly REVERSE=$'\033[7m'
 
-What it does:
-  - Manage SSH and serial connections with a text menu.
-  - Optionally store SSH passwords in an encrypted vault.
-  - Detach/minimize sessions when GNU screen is available.
+readonly BLACK=$'\033[30m'
+readonly RED=$'\033[31m'
+readonly GREEN=$'\033[32m'
+readonly YELLOW=$'\033[33m'
+readonly BLUE=$'\033[34m'
+readonly MAGENTA=$'\033[35m'
+readonly CYAN=$'\033[36m'
+readonly WHITE=$'\033[37m'
 
-Exit/minimize:
-  - SSH: type 'exit' or Ctrl+D to return.
-  - SSH (screen): Ctrl+A, D to detach; reattach via TermTrax.
-  - Serial (screen): Ctrl+A, D to detach; Ctrl+A, K to kill.
-  - Serial (picocom): Ctrl+A, Ctrl+X to exit.
-  - Serial (tio): Ctrl+T then Q to exit.
-  - Serial (minicom): Ctrl+A, Z then X to exit.
+readonly BG_BLACK=$'\033[40m'
+readonly BG_BLUE=$'\033[44m'
+readonly BG_CYAN=$'\033[46m'
+readonly BG_WHITE=$'\033[47m'
 
-Dependencies:
-  - Required: bash, ssh
-  - Optional: openssl (vault), screen (detach/reattach), sshpass, tio/picocom/minicom
+# Theme
+readonly C_ACCENT="${CYAN}"
+readonly C_ACCENT2="${MAGENTA}"
+readonly C_HIGHLIGHT="${BG_CYAN}${BLACK}"
+readonly C_FOLDER="${YELLOW}"
+readonly C_SSH="${GREEN}"
+readonly C_SERIAL="${MAGENTA}"
+readonly C_IDENTITY="${BLUE}"
+readonly C_DIM="${DIM}"
 
-Config:
-  - Connections: ~/.config/termtrax/connections.db
-  - Vault: ~/.config/termtrax/vault.enc
-  - Settings: ~/.config/termtrax/settings.conf
-EOF
+#═══════════════════════════════════════════════════════════════════════════════
+# Terminal Utilities
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Get terminal size
+get_term_size() {
+    if command -v tput >/dev/null 2>&1; then
+        TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
+        TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+    else
+        TERM_ROWS=24
+        TERM_COLS=80
+    fi
 }
 
-clear_screen() {
-  if command -v clear >/dev/null 2>&1; then
-    clear
-  else
-    printf '\n\n\n'
-  fi
+# Move cursor
+cursor_to() { printf '\033[%d;%dH' "$1" "$2"; }
+cursor_home() { printf '\033[H'; }
+cursor_hide() { printf '\033[?25l'; }
+cursor_show() { printf '\033[?25h'; }
+
+# Clear
+clear_screen() { printf '\033[2J\033[H'; }
+clear_line() { printf '\033[2K'; }
+clear_below() { printf '\033[J'; }
+
+# Read single key (including arrow keys)
+read_key() {
+    local key
+    IFS= read -rsn1 key 2>/dev/null || return 1
+    
+    if [[ "$key" == $'\033' ]]; then
+        read -rsn2 -t 0.1 key2 2>/dev/null || true
+        key+="$key2"
+    fi
+    
+    case "$key" in
+        $'\033[A'|k) echo "UP" ;;
+        $'\033[B'|j) echo "DOWN" ;;
+        $'\033[C'|l) echo "RIGHT" ;;
+        $'\033[D'|h) echo "LEFT" ;;
+        $'\033[5~') echo "PGUP" ;;
+        $'\033[6~') echo "PGDN" ;;
+        $'\033[H'|$'\033[1~') echo "HOME" ;;
+        $'\033[F'|$'\033[4~') echo "END" ;;
+        ''|$'\n') echo "ENTER" ;;
+        $'\t') echo "TAB" ;;
+        $'\177'|$'\b') echo "BACKSPACE" ;;
+        $'\033'|q|Q) echo "ESC" ;;
+        ' ') echo "SPACE" ;;
+        /) echo "SEARCH" ;;
+        a|A) echo "ADD" ;;
+        e|E) echo "EDIT" ;;
+        d|D) echo "DELETE" ;;
+        c|C) echo "CONNECT" ;;
+        n|N) echo "NEW_FOLDER" ;;
+        i|I) echo "IDENTITY" ;;
+        r|R) echo "REATTACH" ;;
+        s|S) echo "SETTINGS" ;;
+        '?') echo "HELP" ;;
+        *) echo "$key" ;;
+    esac
 }
+
+# Print centered text
+print_center() {
+    local text="$1" width="${2:-$TERM_COLS}"
+    local padding=$(( (width - ${#text}) / 2 ))
+    printf '%*s%s' "$padding" '' "$text"
+}
+
+# Print at position
+print_at() {
+    local row="$1" col="$2" text="$3"
+    cursor_to "$row" "$col"
+    printf '%s' "$text"
+}
+
+# Draw horizontal line
+draw_line() {
+    local char="${1:-─}" width="${2:-$TERM_COLS}"
+    printf '%*s' "$width" '' | tr ' ' "$char"
+}
+
+# Input with prompt (shows cursor, handles input)
+prompt_input() {
+    local prompt="$1" default="${2:-}" secret="${3:-}"
+  local value=""
+    
+    cursor_show
+    # All prompts go to stderr so they don't mix with return value
+    printf "${BOLD}%s${RST}" "$prompt" >&2
+    [[ -n "$default" ]] && printf " ${DIM}[%s]${RST}" "$default" >&2
+    printf ": " >&2
+    
+    if [[ "$secret" == "secret" ]]; then
+        read -rs value
+        echo >&2
+    else
+        read -r value
+    fi
+    
+    cursor_hide
+    printf '%s' "${value:-$default}"
+}
+
+# Yes/No prompt
+prompt_confirm() {
+    local prompt="$1" default="${2:-n}"
+    cursor_show
+    printf "${BOLD}%s${RST} " "$prompt" >&2
+    if [[ "$default" == "y" ]]; then
+        printf "${DIM}[Y/n]${RST}: " >&2
+    else
+        printf "${DIM}[y/N]${RST}: " >&2
+    fi
+    
+    local choice=""
+    read -r choice
+    cursor_hide
+    choice="${choice:-$default}"
+    [[ "${choice,,}" == "y" ]]
+}
+
+# Show message (all to stderr so they display properly)
+msg_info() { printf "${CYAN}ℹ${RST} %s\n" "$1" >&2; }
+msg_success() { printf "${GREEN}✓${RST} %s\n" "$1" >&2; }
+msg_warn() { printf "${YELLOW}⚠${RST} %s\n" "$1" >&2; }
+msg_error() { printf "${RED}✗${RST} %s\n" "$1" >&2; }
+
+# Pause
+pause() {
+    printf "\n${DIM}Press any key...${RST}" >&2
+    read -rsn1
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Encryption & Session Management
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Get machine-specific key component
+get_machine_key() {
+    local machine_id=""
+    if [[ -f "$MACHINE_ID_FILE" ]]; then
+        machine_id=$(cat "$MACHINE_ID_FILE" 2>/dev/null)
+    fi
+    # Fallback to hostname + user if no machine-id
+    [[ -z "$machine_id" ]] && machine_id="${HOSTNAME:-$(hostname)}:${USER}:${UID}"
+    printf '%s' "$machine_id"
+}
+
+# Derive session key from master password + machine ID
+derive_session_key() {
+    local master="$1"
+    local machine_key
+    machine_key=$(get_machine_key)
+    # PBKDF2-like derivation using openssl
+    printf '%s%s' "$master" "$machine_key" | openssl dgst -sha256 -binary | base64
+}
+
+# Encrypt data
+encrypt_data() {
+    local data="$1" key="$2"
+    printf '%s' "$data" | openssl enc -aes-256-cbc -md sha512 -a -pbkdf2 -iter 100000 -salt -pass pass:"$key" 2>/dev/null
+}
+
+# Decrypt data
+decrypt_data() {
+    local encrypted="$1" key="$2"
+    printf '%s' "$encrypted" | openssl enc -d -aes-256-cbc -md sha512 -a -pbkdf2 -iter 100000 -salt -pass pass:"$key" 2>/dev/null
+}
+
+# Save session token (encrypted master password, machine-bound)
+save_session() {
+    local machine_key
+    machine_key=$(get_machine_key)
+    local token
+    token=$(encrypt_data "$VAULT_MASTER" "$machine_key")
+    printf '%s' "$token" > "$SESSION_FILE"
+    chmod 600 "$SESSION_FILE"
+}
+
+# Load session token
+load_session() {
+    [[ -f "$SESSION_FILE" ]] || return 1
+    local token machine_key
+    token=$(cat "$SESSION_FILE" 2>/dev/null) || return 1
+    machine_key=$(get_machine_key)
+    VAULT_MASTER=$(decrypt_data "$token" "$machine_key" 2>/dev/null) || return 1
+    [[ -n "$VAULT_MASTER" ]]
+}
+
+# Clear session
+clear_session() {
+    rm -f "$SESSION_FILE" 2>/dev/null
+    VAULT_MASTER=""
+    SESSION_KEY=""
+}
+
+# Initialize vault with new master password
+vault_init() {
+    clear_screen
+    print_header
+    printf "\n"
+    print_center "Welcome to TermTrax!" 
+    printf "\n\n"
+    print_center "Create a master password to encrypt your data."
+    printf "\n"
+    print_center "${DIM}This password protects all your connections and credentials.${RST}"
+    printf "\n\n"
+    
+    local pw1 pw2
+  while true; do
+        pw1=$(prompt_input "  Master password" "" "secret")
+        [[ -z "$pw1" ]] && { msg_warn "Password cannot be empty"; continue; }
+        pw2=$(prompt_input "  Confirm password" "" "secret")
+        [[ "$pw1" != "$pw2" ]] && { msg_warn "Passwords don't match"; continue; }
+        break
+    done
+    
+    VAULT_MASTER="$pw1"
+    SESSION_KEY=$(derive_session_key "$VAULT_MASTER")
+    
+    # Initialize empty data structure
+    DATA=()
+    DATA[version]="3"
+    DATA[folders]=""
+    DATA[connections]=""
+    DATA[identities]=""
+    
+    save_data
+    save_session
+    msg_success "Vault created!"
+    sleep 1
+}
+
+# Unlock vault
+vault_unlock() {
+    # Try loading existing session first
+    if load_session; then
+        SESSION_KEY=$(derive_session_key "$VAULT_MASTER")
+        if load_data; then
+      return 0
+    fi
+        # Session invalid, clear it
+        clear_session
+    fi
+    
+    # No valid session, need password
+    clear_screen
+    print_header
+    printf "\n\n"
+    
+    if [[ ! -f "$DB_FILE" ]]; then
+        vault_init
+        return $?
+    fi
+    
+    print_center "Enter your master password"
+    printf "\n\n"
+    
+    local attempts=0
+    while (( attempts < 3 )); do
+        VAULT_MASTER=$(prompt_input "  Password" "" "secret")
+        SESSION_KEY=$(derive_session_key "$VAULT_MASTER")
+        
+        if load_data; then
+            save_session
+      return 0
+    fi
+        
+        ((attempts++))
+        msg_error "Wrong password (attempt $attempts/3)"
+        VAULT_MASTER=""
+        SESSION_KEY=""
+    done
+    
+    msg_error "Too many failed attempts"
+    exit 1
+}
+
+# Lock vault (clear session)
+vault_lock() {
+    clear_session
+    msg_info "Vault locked"
+    sleep 1
+    vault_unlock
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Data Storage (Encrypted)
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Serialize DATA array to string
+serialize_data() {
+    local result=""
+    for key in "${!DATA[@]}"; do
+        local value="${DATA[$key]}"
+        # Escape newlines and pipes
+        value="${value//$'\n'/\\n}"
+        value="${value//|/\\p}"
+        result+="${key}|${value}"$'\n'
+    done
+    printf '%s' "$result"
+}
+
+# Deserialize string to DATA array
+deserialize_data() {
+    local input="$1"
+    DATA=()
+    local line key value
+    while IFS='|' read -r key value; do
+        [[ -z "$key" ]] && continue
+        # Unescape
+        value="${value//\\n/$'\n'}"
+        value="${value//\\p/|}"
+        DATA[$key]="$value"
+    done <<< "$input"
+}
+
+# Save encrypted data
+save_data() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    
+    local plain encrypted tmp
+    plain=$(serialize_data)
+    encrypted=$(encrypt_data "$plain" "$SESSION_KEY")
+    
+    tmp=$(mktemp "${DB_FILE}.XXXX")
+    printf '%s' "$encrypted" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$DB_FILE"
+}
+
+# Load encrypted data
+load_data() {
+    [[ -f "$DB_FILE" ]] || return 1
+    
+    local encrypted plain
+    encrypted=$(cat "$DB_FILE") || return 1
+    plain=$(decrypt_data "$encrypted" "$SESSION_KEY") || return 1
+    
+    deserialize_data "$plain"
+    [[ -n "${DATA[version]:-}" ]]
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Data Model Helpers
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Generate unique ID
+gen_id() {
+    printf '%s' "$(date +%s%N | sha256sum | head -c 8)"
+}
+
+# Folders: stored as newline-separated "id:name:parent_id"
+get_folders() {
+    printf '%s' "${DATA[folders]:-}"
+}
+
+add_folder() {
+    local name="$1" parent="${2:-}"
+    local id
+    id=$(gen_id)
+    local folders="${DATA[folders]:-}"
+    [[ -n "$folders" ]] && folders+=$'\n'
+    folders+="${id}:${name}:${parent}"
+    DATA[folders]="$folders"
+    save_data
+    printf '%s' "$id"
+}
+
+delete_folder() {
+    local target_id="$1"
+    local new_folders="" line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        [[ "$id" != "$target_id" ]] && { [[ -n "$new_folders" ]] && new_folders+=$'\n'; new_folders+="$line"; }
+    done <<< "${DATA[folders]:-}"
+    DATA[folders]="$new_folders"
+    
+    # Also delete connections in this folder
+    local new_conns=""
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local folder="${line#*:*:*:*:*:*:*:*:*:*:}"
+        folder="${folder%%:*}"
+        [[ "$folder" != "$target_id" ]] && { [[ -n "$new_conns" ]] && new_conns+=$'\n'; new_conns+="$line"; }
+    done <<< "${DATA[connections]:-}"
+    DATA[connections]="$new_conns"
+    
+    save_data
+}
+
+# Identities: stored as newline-separated "id:name:username:auth_type:key_path:password_enc"
+get_identities() {
+    printf '%s' "${DATA[identities]:-}"
+}
+
+add_identity() {
+    local name="$1" username="$2" auth_type="$3" key_path="$4" password="$5"
+    local id
+    id=$(gen_id)
+    
+    # Encrypt password if provided
+    local pass_enc=""
+    [[ -n "$password" ]] && pass_enc=$(encrypt_data "$password" "$SESSION_KEY" | tr -d '\n')
+    
+    local identities="${DATA[identities]:-}"
+    [[ -n "$identities" ]] && identities+=$'\n'
+    identities+="${id}:${name}:${username}:${auth_type}:${key_path}:${pass_enc}"
+    DATA[identities]="$identities"
+    save_data
+    printf '%s' "$id"
+}
+
+get_identity() {
+    local target_id="$1"
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        [[ "$id" == "$target_id" ]] && { printf '%s' "$line"; return 0; }
+    done <<< "${DATA[identities]:-}"
+    return 1
+}
+
+get_identity_password() {
+    local identity_line="$1"
+    local pass_enc="${identity_line##*:}"
+    [[ -z "$pass_enc" ]] && return 1
+    decrypt_data "$pass_enc" "$SESSION_KEY"
+}
+
+delete_identity() {
+    local target_id="$1"
+    local new_ids="" line
+    while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        [[ "$id" != "$target_id" ]] && { [[ -n "$new_ids" ]] && new_ids+=$'\n'; new_ids+="$line"; }
+    done <<< "${DATA[identities]:-}"
+    DATA[identities]="$new_ids"
+    save_data
+}
+
+# Connections: "id:type:name:host:port:identity_id:key_path:password_enc:device:baud:folder_id"
+get_connections() {
+    printf '%s' "${DATA[connections]:-}"
+}
+
+add_connection() {
+    local type="$1" name="$2" host="$3" port="$4" identity_id="$5" key_path="$6" password="$7" device="$8" baud="$9" folder_id="${10:-}"
+    local id
+    id=$(gen_id)
+    
+    local pass_enc=""
+    [[ -n "$password" ]] && pass_enc=$(encrypt_data "$password" "$SESSION_KEY" | tr -d '\n')
+    
+    local conns="${DATA[connections]:-}"
+    [[ -n "$conns" ]] && conns+=$'\n'
+    conns+="${id}:${type}:${name}:${host}:${port}:${identity_id}:${key_path}:${pass_enc}:${device}:${baud}:${folder_id}"
+    DATA[connections]="$conns"
+    save_data
+    printf '%s' "$id"
+}
+
+get_connection() {
+    local target_id="$1"
+    local line
+    while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        [[ "$id" == "$target_id" ]] && { printf '%s' "$line"; return 0; }
+    done <<< "${DATA[connections]:-}"
+    return 1
+}
+
+update_connection() {
+    local target_id="$1" new_line="$2"
+    local new_conns="" line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        if [[ "$id" == "$target_id" ]]; then
+            [[ -n "$new_conns" ]] && new_conns+=$'\n'
+            new_conns+="$new_line"
+        else
+            [[ -n "$new_conns" ]] && new_conns+=$'\n'
+            new_conns+="$line"
+        fi
+    done <<< "${DATA[connections]:-}"
+    DATA[connections]="$new_conns"
+    save_data
+}
+
+delete_connection() {
+    local target_id="$1"
+    local new_conns="" line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        [[ "$id" != "$target_id" ]] && { [[ -n "$new_conns" ]] && new_conns+=$'\n'; new_conns+="$line"; }
+    done <<< "${DATA[connections]:-}"
+    DATA[connections]="$new_conns"
+    save_data
+}
+
+get_connection_password() {
+    local conn_line="$1"
+    # Extract password_enc (field 8, 0-indexed 7)
+    local IFS=':'
+    local -a fields
+    read -ra fields <<< "$conn_line"
+    local pass_enc="${fields[7]:-}"
+    [[ -z "$pass_enc" ]] && return 1
+    decrypt_data "$pass_enc" "$SESSION_KEY"
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# UI Components
+#═══════════════════════════════════════════════════════════════════════════════
 
 print_header() {
-  printf '=== %s ===\n' "$1"
+    get_term_size
+    printf "${C_ACCENT}${BOLD}"
+    printf '╔'
+    printf '%.0s═' $(seq 1 $((TERM_COLS - 2)))
+    printf '╗\n'
+    
+    local title="⚡ TermTrax v${VERSION} ⚡"
+    printf '║'
+    print_center "$title" $((TERM_COLS - 2))
+    printf '║\n'
+    
+    printf '╚'
+    printf '%.0s═' $(seq 1 $((TERM_COLS - 2)))
+    printf '╝'
+    printf "${RST}\n"
 }
 
-pause() {
-  local _
-  read -r -p "Press Enter to continue..." _ || true
-}
-
-sanitize_field() {
-  local value="$1"
-  value="${value//$'\n'/ }"
-  value="${value//|/}"
-  printf '%s' "$value"
-}
-
-expand_path() {
-  local path="$1"
-  if [[ "$path" == "~/"* ]]; then
-    printf '%s' "$HOME/${path#~/}"
-  else
-    printf '%s' "$path"
-  fi
-}
-
-ensure_config_dir() {
-  mkdir -p "$CONFIG_DIR"
-  chmod 700 "$CONFIG_DIR"
-}
-
-config_init() {
-  if [[ ! -f "$DB_FILE" ]]; then
-    ensure_config_dir
-    printf '%s\n' "$DB_HEADER" > "$DB_FILE"
-    chmod 600 "$DB_FILE"
-  fi
-}
-
-load_settings() {
-  if [[ -f "$SETTINGS_FILE" ]]; then
-    local line key value
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      [[ -z "$line" || "$line" == \#* ]] && continue
-      IFS='=' read -r key value <<< "$line"
-      case "$key" in
-        DEFAULT_BAUD) DEFAULT_BAUD="$value" ;;
-      esac
-    done < "$SETTINGS_FILE"
-  fi
-}
-
-save_settings() {
-  ensure_config_dir
-  local tmp
-  tmp="$(mktemp "${SETTINGS_FILE}.tmp.XXXX")"
-  {
-    printf '%s\n' "# TermTrax settings"
-    printf 'DEFAULT_BAUD=%s\n' "$DEFAULT_BAUD"
-  } > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$SETTINGS_FILE"
-}
-
-prompt_input() {
-  local prompt="$1"
-  local default="${2-}"
-  local value=""
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " value || true
-    value="${value:-$default}"
-  else
-    read -r -p "$prompt: " value || true
-  fi
-  printf '%s' "$value"
-}
-
-prompt_input_allow_clear() {
-  local prompt="$1"
-  local default="${2-}"
-  local value
-  value="$(prompt_input "$prompt (use '-' to clear)" "$default")"
-  if [[ "$value" == "-" ]]; then
-    value=""
-  fi
-  printf '%s' "$value"
-}
-
-prompt_required() {
-  local prompt="$1"
-  local value=""
-  while [[ -z "$value" ]]; do
-    read -r -p "$prompt: " value || true
-    if [[ -z "$value" ]]; then
-      echo "Value required."
+print_breadcrumb() {
+    local path="/"
+    if [[ -n "$CURRENT_FOLDER" ]]; then
+        # Build path from folder
+        local folder_line folder_name
+        folder_line=$(get_folder_by_id "$CURRENT_FOLDER")
+        if [[ -n "$folder_line" ]]; then
+            folder_name="${folder_line#*:}"
+            folder_name="${folder_name%%:*}"
+            path="/ ${folder_name}"
+        fi
     fi
-  done
-  printf '%s' "$value"
+    printf " ${DIM}📁 %s${RST}\n" "$path"
 }
 
-confirm_yes_no() {
-  local prompt="$1"
-  local default="${2:-n}"
-  local choice=""
-  while true; do
-    read -r -p "$prompt [y/n]: " choice || true
-    choice="${choice:-$default}"
-    case "$choice" in
-      y|Y) return 0 ;;
-      n|N) return 1 ;;
-      *) echo "Please enter y or n." ;;
-    esac
-  done
-}
-
-prompt_auth_type() {
-  local current="${1-}"
-  local choice=""
-  while true; do
-    printf '%s\n' "Auth type: [1] key  [2] password  [3] agent" >&2
-    read -r -p "Select auth type${current:+ (Enter to keep $current)}: " choice || true
-    if [[ -z "$choice" && -n "$current" ]]; then
-      printf '%s' "$current"
-      return 0
-    fi
-    case "$choice" in
-      1|key) printf 'key'; return 0 ;;
-      2|password) printf 'password'; return 0 ;;
-      3|agent) printf 'agent'; return 0 ;;
-      *) printf '%s\n' "Invalid selection." >&2 ;;
-    esac
-  done
-}
-
-prompt_connection_type() {
-  local current="${1-}"
-  local choice=""
-  while true; do
-    printf '%s\n' "Type: [1] ssh  [2] serial" >&2
-    read -r -p "Select type${current:+ (Enter to keep $current)}: " choice || true
-    if [[ -z "$choice" && -n "$current" ]]; then
-      printf '%s' "$current"
-      return 0
-    fi
-    case "$choice" in
-      1|ssh) printf 'ssh'; return 0 ;;
-      2|serial) printf 'serial'; return 0 ;;
-      *) printf '%s\n' "Invalid selection." >&2 ;;
-    esac
-  done
-}
-
-load_connections() {
-  config_init
-  CONNECTION_LINES=()
+get_folder_by_id() {
+    local target_id="$1"
   local line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" || "$line" == "$DB_HEADER" || "$line" == \#* ]] && continue
-    CONNECTION_LINES+=("$line")
-  done < "$DB_FILE"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        [[ "$id" == "$target_id" ]] && { printf '%s' "$line"; return 0; }
+    done <<< "${DATA[folders]:-}"
+    return 1
 }
 
-save_connections() {
-  ensure_config_dir
-  local tmp
-  tmp="$(mktemp "${DB_FILE}.tmp.XXXX")"
-  {
-    printf '%s\n' "$DB_HEADER"
-    for line in "${CONNECTION_LINES[@]}"; do
-      printf '%s\n' "$line"
+print_footer() {
+    cursor_to $((TERM_ROWS - 1)) 1
+    printf "${BG_BLACK}${WHITE}"
+    printf '%-*s' "$TERM_COLS" " ↑↓ Navigate  Enter Select  a Add  d Delete  n Folder  r Reattach  s Settings  ? Help"
+    printf "${RST}"
+}
+
+# Build menu items for current folder
+build_menu() {
+    MENU_ITEMS=()
+    MENU_IDS=()
+    
+    # Add parent folder option if in subfolder
+    if [[ -n "$CURRENT_FOLDER" ]]; then
+        MENU_ITEMS+=("${DIM}↩ .. (back)${RST}")
+        MENU_IDS+=("PARENT")
+    fi
+    
+    # Add folders in current location
+  local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local id="${line%%:*}"
+        local rest="${line#*:}"
+        local name="${rest%%:*}"
+        local parent="${rest#*:}"
+        
+        # Only show folders in current location
+        if [[ "$parent" == "$CURRENT_FOLDER" ]]; then
+            MENU_ITEMS+=("${C_FOLDER}📁 ${name}${RST}")
+            MENU_IDS+=("F:${id}")
+        fi
+    done <<< "${DATA[folders]:-}"
+    
+    # Add connections in current folder
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        
+        local IFS=':'
+        local -a fields
+        read -ra fields <<< "$line"
+        local id="${fields[0]}"
+        local type="${fields[1]}"
+        local name="${fields[2]}"
+        local host="${fields[3]}"
+        local port="${fields[4]}"
+        local identity_id="${fields[5]}"
+        local device="${fields[8]}"
+        local baud="${fields[9]}"
+        local folder_id="${fields[10]}"
+        
+        # Only show connections in current folder
+        [[ "$folder_id" != "$CURRENT_FOLDER" ]] && continue
+        
+        local icon color detail
+  if [[ "$type" == "ssh" ]]; then
+            icon="🖥"
+            color="$C_SSH"
+            local user_info=""
+            if [[ -n "$identity_id" ]]; then
+                local id_line
+                id_line=$(get_identity "$identity_id")
+                if [[ -n "$id_line" ]]; then
+                    local id_name="${id_line#*:}"
+                    id_name="${id_name%%:*}"
+                    user_info="[${id_name}]"
+                fi
+            fi
+            detail="${host}:${port:-22} ${user_info}"
+        else
+            icon="📟"
+            color="$C_SERIAL"
+            detail="${device} @${baud:-115200}"
+        fi
+        
+        MENU_ITEMS+=("${color}${icon} ${name}${RST}  ${DIM}${detail}${RST}")
+        MENU_IDS+=("C:${id}")
+    done <<< "${DATA[connections]:-}"
+    
+    # Add "empty" message if nothing
+    if [[ ${#MENU_ITEMS[@]} -eq 0 ]] || [[ ${#MENU_ITEMS[@]} -eq 1 && "${MENU_IDS[0]}" == "PARENT" ]]; then
+        if [[ ${#MENU_ITEMS[@]} -eq 0 ]]; then
+            MENU_ITEMS+=("${DIM}(empty - press 'a' to add)${RST}")
+            MENU_IDS+=("EMPTY")
+        fi
+    fi
+    
+    # Clamp selection
+    if (( MENU_SELECTED >= ${#MENU_ITEMS[@]} )); then
+        MENU_SELECTED=$(( ${#MENU_ITEMS[@]} - 1 ))
+    fi
+    (( MENU_SELECTED < 0 )) && MENU_SELECTED=0
+}
+
+# Render menu
+render_menu() {
+    get_term_size
+  clear_screen
+    print_header
+    print_breadcrumb
+    printf "\n"
+    
+    local visible_rows=$((TERM_ROWS - 8))
+    local start=0
+    
+    # Scroll if needed
+    if (( MENU_SELECTED >= visible_rows )); then
+        start=$((MENU_SELECTED - visible_rows + 1))
+    fi
+    
+    local i
+    for (( i = start; i < ${#MENU_ITEMS[@]} && i < start + visible_rows; i++ )); do
+        if (( i == MENU_SELECTED )); then
+            printf " ${C_HIGHLIGHT} ▸ %s ${RST}\n" "${MENU_ITEMS[$i]}"
+        else
+            printf "   %s\n" "${MENU_ITEMS[$i]}"
+        fi
     done
-  } > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$DB_FILE"
+    
+    # Fill remaining space
+    local rendered=$((i - start))
+    for (( j = rendered; j < visible_rows; j++ )); do
+        printf "\n"
+    done
+    
+    print_footer
 }
 
-get_next_id() {
-  local max=0
-  local line id
-  for line in "${CONNECTION_LINES[@]}"; do
-    IFS='|' read -r id _ <<< "$line"
-    if [[ "$id" =~ ^[0-9]+$ ]] && (( id > max )); then
-      max="$id"
+#═══════════════════════════════════════════════════════════════════════════════
+# Connection Dialogs
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Select identity dialog
+select_identity() {
+    local identities=()
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        identities+=("$line")
+    done <<< "${DATA[identities]:-}"
+    
+    if [[ ${#identities[@]} -eq 0 ]]; then
+        printf '%s' ""
+        return
     fi
-  done
-  printf '%s' "$((max + 1))"
-}
-
-find_connection_index_by_id() {
-  local target="$1"
-  local idx=0 line id
-  for line in "${CONNECTION_LINES[@]}"; do
-    IFS='|' read -r id _ <<< "$line"
-    if [[ "$id" == "$target" ]]; then
-      printf '%s' "$idx"
-      return 0
-    fi
-    idx=$((idx + 1))
-  done
-  return 1
-}
-
-format_connection() {
-  local line="$1"
-  local id type name user host port auth_type key_path serial_dev baud parity databits stopbits tags
-  IFS='|' read -r id type name user host port auth_type key_path serial_dev baud parity databits stopbits tags <<< "$line"
-  local summary=""
-  if [[ "$type" == "ssh" ]]; then
-    port="${port:-22}"
-    summary="ssh: ${user}@${host}:${port}, ${auth_type}"
-  else
-    baud="${baud:-$DEFAULT_BAUD}"
-    summary="serial: ${serial_dev} @${baud}"
-  fi
-  if [[ -n "${tags-}" ]]; then
-    summary="${summary} - ${tags}"
-  fi
-  printf '[%s] %s (%s)\n' "$id" "$name" "$summary"
-}
-
-list_connections() {
-  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
-    echo "No connections defined."
-    return 0
-  fi
-  local line
-  for line in "${CONNECTION_LINES[@]}"; do
-    format_connection "$line"
-  done
-}
-
-vault_require_openssl() {
-  if ! command -v openssl >/dev/null 2>&1; then
-    VAULT_ENABLED=0
-    if [[ "$VAULT_WARNED" -eq 0 ]]; then
-      echo "OpenSSL not found. Vault features are disabled."
-      VAULT_WARNED=1
-    fi
-    return 1
-  fi
-  return 0
-}
-
-vault_init() {
-  if [[ -f "$VAULT_FILE" ]]; then
-    return 0
-  fi
-  vault_require_openssl || return 1
-  ensure_config_dir
-  echo "No vault found. Create a new master password."
-  local pw1 pw2
-  while true; do
-    read -rs -p "Create master password: " pw1 || true
-    echo
-    read -rs -p "Confirm master password: " pw2 || true
-    echo
-    if [[ -z "$pw1" ]]; then
-      echo "Master password cannot be empty."
-      continue
-    fi
-    if [[ "$pw1" != "$pw2" ]]; then
-      echo "Passwords do not match."
-      continue
-    fi
-    VAULT_MASTER="$pw1"
-    break
-  done
-  vault_write_data ""
-}
-
-vault_write_data() {
-  local data="$1"
-  vault_require_openssl || return 1
-  ensure_config_dir
-  local tmp
-  tmp="$(mktemp "${VAULT_FILE}.tmp.XXXX")"
-  printf '%s' "$data" | openssl enc -aes-256-cbc -md sha512 -a -pbkdf2 -iter 100000 -salt \
-    -pass pass:"$VAULT_MASTER" > "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$VAULT_FILE"
-}
-
-vault_read_data() {
-  vault_require_openssl || return 1
-  if [[ ! -f "$VAULT_FILE" ]]; then
-    return 1
-  fi
-  local data
-  if ! data="$(openssl enc -d -aes-256-cbc -md sha512 -a -pbkdf2 -iter 100000 -salt \
-    -pass pass:"$VAULT_MASTER" -in "$VAULT_FILE" 2>/dev/null)"; then
-    echo "Vault: wrong master password."
-    VAULT_MASTER=""
-    return 1
-  fi
-  printf '%s' "$data"
-}
-
-vault_require_master() {
-  vault_require_openssl || return 1
-  if [[ -z "$VAULT_MASTER" ]]; then
-    read -rs -p "Master password: " VAULT_MASTER || true
-    echo
-  fi
-  return 0
-}
-
-vault_set() {
-  local key="$1"
-  local password="$2"
-  vault_require_openssl || return 1
-  vault_init || return 1
-  vault_require_master || return 1
-  if [[ "$password" == *"|"* ]]; then
-    echo "Password contains '|', which is not supported."
-    return 1
-  fi
-  local data line new_data=""
-  if ! data="$(vault_read_data)"; then
-    return 1
-  fi
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    if [[ "$line" != "$key|"* ]]; then
-      new_data+="${line}"$'\n'
-    fi
-  done <<< "$data"
-  new_data+="${key}|${password}"
-  vault_write_data "$new_data"
-}
-
-vault_get() {
-  local key="$1"
-  vault_require_openssl || return 1
-  if [[ ! -f "$VAULT_FILE" ]]; then
-    return 1
-  fi
-  vault_require_master || return 1
-  local data line id pass
-  data="$(vault_read_data)" || return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    IFS='|' read -r id pass <<< "$line"
-    if [[ "$id" == "$key" ]]; then
-      printf '%s' "$pass"
-      return 0
-    fi
-  done <<< "$data"
-  return 1
-}
-
-vault_delete() {
-  local key="$1"
-  vault_require_openssl || return 0
-  if [[ ! -f "$VAULT_FILE" ]]; then
-    return 0
-  fi
-  vault_require_master || return 0
-  local data line new_data=""
-  if ! data="$(vault_read_data)"; then
-    return 1
-  fi
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    if [[ "$line" != "$key|"* ]]; then
-      new_data+="${line}"$'\n'
-    fi
-  done <<< "$data"
-  new_data="${new_data%$'\n'}"
-  vault_write_data "$new_data"
-}
-
-reset_vault() {
-  if [[ ! -f "$VAULT_FILE" ]]; then
-    echo "Vault not found."
-    return 0
-  fi
-  if ! confirm_yes_no "Really reset and delete the vault?" "n"; then
-    return 0
-  fi
-  if command -v shred >/dev/null 2>&1; then
-    shred -u "$VAULT_FILE"
-  else
-    rm -f "$VAULT_FILE"
-  fi
-  VAULT_MASTER=""
-  echo "Vault reset."
-}
-
-connection_add() {
-  clear_screen
-  print_header "TermTrax: Add Connection"
-  load_connections
-  local id type name user host port auth_type key_path serial_dev baud parity databits stopbits tags
-  id="$(get_next_id)"
-  type="$(prompt_connection_type "")"
-  name="$(prompt_required "Name")"
-  name="$(sanitize_field "$name")"
-  if [[ "$type" == "ssh" ]]; then
-    user="$(prompt_required "Username")"
-    user="$(sanitize_field "$user")"
-    host="$(prompt_required "Hostname/IP")"
-    host="$(sanitize_field "$host")"
-    port="$(prompt_input "Port" "22")"
-    auth_type="$(prompt_auth_type "key")"
-    if [[ "$auth_type" == "key" ]]; then
-      key_path="$(prompt_input_allow_clear "Key path" "~/.ssh/id_rsa")"
-      key_path="$(sanitize_field "$key_path")"
-    elif [[ "$auth_type" == "password" ]]; then
-      if vault_require_openssl; then
-        if confirm_yes_no "Store password in vault?" "y"; then
-          local pw
-          read -rs -p "SSH password: " pw || true
-          echo
-          if [[ -n "$pw" ]]; then
-            vault_set "$id" "$pw" || echo "Failed to store password."
-          fi
-          unset pw
-        fi
-      else
-        echo "Vault disabled; password will not be stored."
-      fi
-    fi
-    tags="$(prompt_input_allow_clear "Notes/tags" "")"
-    tags="$(sanitize_field "$tags")"
-  else
-    serial_dev="$(prompt_required "Device path")"
-    serial_dev="$(sanitize_field "$serial_dev")"
-    baud="$(prompt_input "Baud rate" "$DEFAULT_BAUD")"
-    parity="$(prompt_input_allow_clear "Parity (N/E/O or blank)" "")"
-    databits="$(prompt_input_allow_clear "Data bits (5-8 or blank)" "")"
-    stopbits="$(prompt_input_allow_clear "Stop bits (1/2 or blank)" "")"
-    tags="$(prompt_input_allow_clear "Notes/tags" "")"
-    tags="$(sanitize_field "$tags")"
-  fi
-  local line
-  line="${id}|${type}|${name}|${user-}|${host-}|${port-}|${auth_type-}|${key_path-}|${serial_dev-}|${baud-}|${parity-}|${databits-}|${stopbits-}|${tags-}"
-  CONNECTION_LINES+=("$line")
-  save_connections
-  echo "Added connection [$id] $name."
-  pause
-}
-
-connection_edit() {
-  clear_screen
-  print_header "TermTrax: Edit Connection"
-  load_connections
-  list_connections
-  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
-    pause
-    return 0
-  fi
-  local id
-  id="$(prompt_required "Enter ID to edit")"
-  local idx
-  if ! idx="$(find_connection_index_by_id "$id")"; then
-    echo "Connection ID not found."
-    pause
-    return 0
-  fi
-  local line
-  line="${CONNECTION_LINES[$idx]}"
-  local type name user host port auth_type key_path serial_dev baud parity databits stopbits tags
-  IFS='|' read -r _ type name user host port auth_type key_path serial_dev baud parity databits stopbits tags <<< "$line"
-  local old_auth_type="$auth_type"
-  type="$(prompt_connection_type "$type")"
-  name="$(prompt_input "Name" "$name")"
-  name="$(sanitize_field "$name")"
-  if [[ "$type" == "ssh" ]]; then
-    user="$(prompt_input "Username" "$user")"
-    user="$(sanitize_field "$user")"
-    host="$(prompt_input "Hostname/IP" "$host")"
-    host="$(sanitize_field "$host")"
-    port="$(prompt_input "Port" "${port:-22}")"
-    auth_type="$(prompt_auth_type "$auth_type")"
-    if [[ "$auth_type" == "key" ]]; then
-      key_path="$(prompt_input_allow_clear "Key path" "${key_path:-~/.ssh/id_rsa}")"
-      key_path="$(sanitize_field "$key_path")"
-      if [[ "$old_auth_type" == "password" ]]; then
-        vault_delete "$id" || true
-      fi
-    elif [[ "$auth_type" == "password" ]]; then
-      if vault_require_openssl; then
-        if confirm_yes_no "Update stored password?" "n"; then
-          local pw
-          read -rs -p "SSH password: " pw || true
-          echo
-          if [[ -n "$pw" ]]; then
-            vault_set "$id" "$pw" || echo "Failed to store password."
-          fi
-          unset pw
-        fi
-      else
-        echo "Vault disabled; password will not be stored."
-      fi
-      key_path=""
-    else
-      key_path=""
-      if [[ "$old_auth_type" == "password" ]]; then
-        vault_delete "$id" || true
-      fi
-    fi
-    tags="$(prompt_input_allow_clear "Notes/tags" "$tags")"
-    tags="$(sanitize_field "$tags")"
-    serial_dev=""
-    baud=""
-    parity=""
-    databits=""
-    stopbits=""
-  else
-    serial_dev="$(prompt_input "Device path" "$serial_dev")"
-    serial_dev="$(sanitize_field "$serial_dev")"
-    baud="$(prompt_input "Baud rate" "${baud:-$DEFAULT_BAUD}")"
-    parity="$(prompt_input_allow_clear "Parity (N/E/O or blank)" "$parity")"
-    databits="$(prompt_input_allow_clear "Data bits (5-8 or blank)" "$databits")"
-    stopbits="$(prompt_input_allow_clear "Stop bits (1/2 or blank)" "$stopbits")"
-    tags="$(prompt_input_allow_clear "Notes/tags" "$tags")"
-    tags="$(sanitize_field "$tags")"
-    user=""
-    host=""
-    port=""
-    auth_type=""
-    key_path=""
-    if [[ "$old_auth_type" == "password" ]]; then
-      vault_delete "$id" || true
-    fi
-  fi
-  CONNECTION_LINES[$idx]="${id}|${type}|${name}|${user-}|${host-}|${port-}|${auth_type-}|${key_path-}|${serial_dev-}|${baud-}|${parity-}|${databits-}|${stopbits-}|${tags-}"
-  save_connections
-  echo "Updated connection [$id] $name."
-  pause
-}
-
-connection_delete() {
-  clear_screen
-  print_header "TermTrax: Delete Connection"
-  load_connections
-  list_connections
-  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
-    pause
-    return 0
-  fi
-  local id
-  id="$(prompt_required "Enter ID to delete")"
-  local idx
-  if ! idx="$(find_connection_index_by_id "$id")"; then
-    echo "Connection ID not found."
-    pause
-    return 0
-  fi
-  local line type auth_type
-  line="${CONNECTION_LINES[$idx]}"
-  IFS='|' read -r _ type _ _ _ _ auth_type _ _ _ _ _ _ _ <<< "$line"
-  if ! confirm_yes_no "Delete connection ID $id?" "n"; then
-    return 0
-  fi
-  unset 'CONNECTION_LINES[idx]'
-  CONNECTION_LINES=("${CONNECTION_LINES[@]}")
-  save_connections
-  if [[ "$auth_type" == "password" ]]; then
-    vault_delete "$id" || true
-  fi
-  echo "Deleted connection [$id]."
-  pause
-}
-
-run_interactive() {
-  set +e
-  "$@"
-  local rc=$?
-  set -e
-  return $rc
-}
-
-build_ssh_command() {
-  local user="$1"
-  local host="$2"
-  local port="$3"
-  local auth_type="$4"
-  local key_path="$5"
-  port="${port:-22}"
-  SSH_CMD=("ssh" "-p" "$port")
-  if [[ "$auth_type" == "key" && -n "$key_path" ]]; then
-    SSH_CMD+=("-i" "$key_path")
-  fi
-  SSH_CMD+=("${user}@${host}")
-}
-
-ssh_connect() {
-  local id="$1" name="$2" user="$3" host="$4" port="$5" auth_type="$6" key_path="$7"
-  if ! command -v ssh >/dev/null 2>&1; then
-    echo "ssh not found."
-    pause
-    return 0
-  fi
-  local key_path_expanded=""
-  if [[ -n "$key_path" ]]; then
-    key_path_expanded="$(expand_path "$key_path")"
-  fi
-  build_ssh_command "$user" "$host" "$port" "$auth_type" "$key_path_expanded"
-  local -a cmd=("${SSH_CMD[@]}")
 
   clear_screen
-  print_header "TermTrax: SSH Connect"
-  echo "Connecting to: $name"
-  echo "Command: ${cmd[*]}"
-  echo "Tip: type 'exit' or press Ctrl+D to return to TermTrax."
-  echo "SSH escape: use ~. to terminate the session."
-
-  local use_screen=0
-  if command -v screen >/dev/null 2>&1; then
-    use_screen=1
-    echo "Screen detach: Ctrl+A, D (session keeps running)."
-  fi
-
-  local password=""
-  local use_sshpass=0
-  if [[ "$auth_type" == "password" ]]; then
-    if command -v sshpass >/dev/null 2>&1; then
-      if password="$(vault_get "$id" 2>/dev/null)"; then
-        use_sshpass=1
-      else
-        echo "No stored password. You will be prompted by ssh."
-      fi
-    else
-      echo "sshpass not found. You will be prompted by ssh."
-    fi
-  fi
-
-  echo
-  if [[ "$use_screen" -eq 1 ]]; then
-    local session="termtrax-${id}-ssh"
-    if [[ "$use_sshpass" -eq 1 ]]; then
-      run_interactive screen -S "$session" sshpass -p "$password" "${cmd[@]}"
-    else
-      run_interactive screen -S "$session" "${cmd[@]}"
-    fi
-  else
-    if [[ "$use_sshpass" -eq 1 ]]; then
-      run_interactive sshpass -p "$password" "${cmd[@]}"
-    else
-      run_interactive "${cmd[@]}"
-    fi
-  fi
-  unset password
-  echo "SSH session ended."
-  pause
-}
-
-configure_serial_line() {
-  local dev="$1" baud="$2" parity="$3" databits="$4" stopbits="$5"
-  if ! command -v stty >/dev/null 2>&1; then
-    return 0
-  fi
-  local -a stty_args=()
-  stty_args+=("$baud")
-  case "${databits:-}" in
-    5) stty_args+=("cs5") ;;
-    6) stty_args+=("cs6") ;;
-    7) stty_args+=("cs7") ;;
-    8|"") stty_args+=("cs8") ;;
-  esac
-  case "${stopbits:-}" in
-    2) stty_args+=("cstopb") ;;
-    1|"") stty_args+=("-cstopb") ;;
-  esac
-  case "${parity:-}" in
-    E|e) stty_args+=("parenb" "-parodd") ;;
-    O|o) stty_args+=("parenb" "parodd") ;;
-    N|n|"") stty_args+=("-parenb") ;;
-  esac
-  set +e
-  stty -F "$dev" "${stty_args[@]}" 2>/dev/null
-  set -e
-}
-
-serial_tool_detect() {
-  if command -v screen >/dev/null 2>&1; then
-    echo "screen"
-  elif command -v tio >/dev/null 2>&1; then
-    echo "tio"
-  elif command -v picocom >/dev/null 2>&1; then
-    echo "picocom"
-  elif command -v minicom >/dev/null 2>&1; then
-    echo "minicom"
-  else
-    echo ""
-  fi
-}
-
-serial_connect() {
-  local id="$1" name="$2" serial_dev="$3" baud="$4" parity="$5" databits="$6" stopbits="$7"
-  local tool
-  tool="$(serial_tool_detect)"
-  if [[ -z "$tool" ]]; then
-    echo "No serial tool found (screen/tio/picocom/minicom)."
-    pause
-    return 0
-  fi
-  baud="${baud:-$DEFAULT_BAUD}"
-  configure_serial_line "$serial_dev" "$baud" "$parity" "$databits" "$stopbits"
-
-  clear_screen
-  print_header "TermTrax: Serial Connect"
-  echo "Connecting to: $name"
-  case "$tool" in
-    screen)
-      echo "Command: screen $serial_dev $baud"
-      echo "Exit: Ctrl+A, K"
-      echo "Detach: Ctrl+A, D (session keeps running)."
-      ;;
-    tio)
-      echo "Command: tio -b $baud $serial_dev"
-      echo "Exit: Ctrl+T then Q"
-      ;;
-    picocom)
-      echo "Command: picocom -b $baud $serial_dev"
-      echo "Exit: Ctrl+A then Ctrl+X"
-      ;;
-    minicom)
-      echo "Command: minicom -b $baud -D $serial_dev"
-      echo "Exit: Ctrl+A then Z then X"
-      ;;
-  esac
-  echo
-
-  if [[ "$tool" == "screen" ]]; then
-    local session="termtrax-${id}-serial"
-    run_interactive screen -S "$session" "$serial_dev" "$baud"
-  elif [[ "$tool" == "tio" ]]; then
-    run_interactive tio -b "$baud" "$serial_dev"
-  elif [[ "$tool" == "picocom" ]]; then
-    run_interactive picocom -b "$baud" "$serial_dev"
-  else
-    run_interactive minicom -b "$baud" -D "$serial_dev"
-  fi
-  echo "Serial session ended."
-  pause
-}
-
-connection_connect() {
-  clear_screen
-  print_header "TermTrax: Connect"
-  load_connections
-  list_connections
-  if [[ "${#CONNECTION_LINES[@]}" -eq 0 ]]; then
-    pause
-    return 0
-  fi
-  local id
-  id="$(prompt_required "Enter ID to connect")"
-  local idx
-  if ! idx="$(find_connection_index_by_id "$id")"; then
-    echo "Connection ID not found."
-    pause
-    return 0
-  fi
-  local line
-  line="${CONNECTION_LINES[$idx]}"
-  local type name user host port auth_type key_path serial_dev baud parity databits stopbits
-  IFS='|' read -r _ type name user host port auth_type key_path serial_dev baud parity databits stopbits _ <<< "$line"
-  if [[ "$type" == "ssh" ]]; then
-    ssh_connect "$id" "$name" "$user" "$host" "$port" "$auth_type" "$key_path"
-  else
-    serial_connect "$id" "$name" "$serial_dev" "$baud" "$parity" "$databits" "$stopbits"
-  fi
-}
-
-export_config() {
-  clear_screen
-  print_header "TermTrax: Export Config"
-  config_init
-  local path
-  path="$(prompt_input "Export path" "./termtrax-connections.db")"
-  if [[ -z "$path" ]]; then
-    echo "No path provided."
-    pause
-    return 0
-  fi
-  if [[ -f "$path" ]]; then
-    if ! confirm_yes_no "File exists. Overwrite?" "n"; then
-      return 0
-    fi
-  fi
-  cp -- "$DB_FILE" "$path"
-  echo "Exported to $path."
-  pause
-}
-
-import_config() {
-  clear_screen
-  print_header "TermTrax: Import Config"
-  local path
-  path="$(prompt_required "Import path")"
-  if [[ ! -f "$path" ]]; then
-    echo "File not found."
-    pause
-    return 0
-  fi
-  local header
-  header="$(head -n 1 "$path" 2>/dev/null || true)"
-  if [[ "$header" != "$DB_HEADER" ]]; then
-    echo "Warning: header mismatch (expected $DB_HEADER)."
-    if ! confirm_yes_no "Import anyway?" "n"; then
-      return 0
-    fi
-  fi
-  if ! confirm_yes_no "Overwrite current connections?" "n"; then
-    return 0
-  fi
-  ensure_config_dir
-  local tmp
-  tmp="$(mktemp "${DB_FILE}.tmp.XXXX")"
-  cp -- "$path" "$tmp"
-  chmod 600 "$tmp"
-  mv "$tmp" "$DB_FILE"
-  echo "Import complete."
-  pause
-}
-
-export_import_menu() {
-  while true; do
-    clear_screen
-    print_header "TermTrax: Export/Import"
-    echo "1) Export config"
-    echo "2) Import config"
-    echo "3) Back"
+    print_header
+    printf "\n  ${BOLD}Select Identity${RST}\n\n"
+    
+    printf "  ${DIM}0${RST}  (none - enter manually)\n"
+    local i=1
+    for id_line in "${identities[@]}"; do
+        local id="${id_line%%:*}"
+        local rest="${id_line#*:}"
+        local name="${rest%%:*}"
+        rest="${rest#*:}"
+        local username="${rest%%:*}"
+        printf "  ${BOLD}%d${RST}  ${C_IDENTITY}👤 %s${RST} ${DIM}(%s)${RST}\n" "$i" "$name" "$username"
+        ((i++))
+    done
+    
+    printf "\n"
     local choice
-    read -r -p "Select option: " choice || true
-    case "$choice" in
-      1) export_config ;;
-      2) import_config ;;
-      3) return 0 ;;
-      *) echo "Invalid selection."; pause ;;
-    esac
-  done
+    choice=$(prompt_input "Select" "0")
+    
+    if [[ "$choice" == "0" || -z "$choice" ]]; then
+        printf '%s' ""
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#identities[@]} )); then
+        local selected="${identities[$((choice-1))]}"
+        printf '%s' "${selected%%:*}"
+    else
+        printf '%s' ""
+    fi
 }
 
-screen_sessions_menu() {
-  local filter="$1"
-  if ! command -v screen >/dev/null 2>&1; then
-    echo "screen not found."
-    pause
-    return 0
-  fi
-  local sessions=()
-  local s
-  mapfile -t sessions < <(screen -ls 2>/dev/null | awk '/termtrax-/{print $1}' || true)
-  local filtered=()
-  for s in "${sessions[@]}"; do
-    case "$filter" in
-      ssh)
-        [[ "$s" == *"-ssh" ]] || continue
-        ;;
-      serial)
-        [[ "$s" == *"-serial" ]] || continue
-        ;;
-    esac
-    filtered+=("$s")
-  done
-  clear_screen
-  case "$filter" in
-    ssh) print_header "TermTrax: SSH Screen Sessions" ;;
-    serial) print_header "TermTrax: Serial Screen Sessions" ;;
-    *) print_header "TermTrax: Screen Sessions" ;;
-  esac
-  if [[ "${#filtered[@]}" -eq 0 ]]; then
-    echo "No matching screen sessions found."
-    pause
-    return 0
-  fi
-  local idx=1
-  for s in "${filtered[@]}"; do
-    echo "[$idx] $s"
-    idx=$((idx + 1))
-  done
-  echo "[0] Back"
-  local choice
-  read -r -p "Select session to attach: " choice || true
-  if [[ "$choice" == "0" || -z "$choice" ]]; then
-    return 0
-  fi
-  if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#filtered[@]} )); then
-    local session="${filtered[$((choice - 1))]}"
-    run_interactive screen -r "$session"
-  else
-    echo "Invalid selection."
-    pause
-  fi
+# Add SSH connection dialog
+add_ssh_dialog() {
+    clear_screen
+    print_header
+    printf "\n  ${BOLD}New SSH Connection${RST}\n\n"
+    
+    local name host port identity_id username auth_type key_path password
+    
+    name=$(prompt_input "  Name")
+    [[ -z "$name" ]] && return
+    
+    host=$(prompt_input "  Host")
+    [[ -z "$host" ]] && return
+    
+    port=$(prompt_input "  Port" "22")
+    
+    printf "\n  ${DIM}Use an identity or enter credentials manually?${RST}\n"
+    printf "  ${BOLD}1${RST}  Select identity\n"
+    printf "  ${BOLD}2${RST}  Enter manually\n\n"
+    
+    local id_choice
+    id_choice=$(prompt_input "  Choice" "1")
+    
+    if [[ "$id_choice" == "1" ]]; then
+        identity_id=$(select_identity)
+        if [[ -z "$identity_id" ]]; then
+            # No identity selected, enter manually
+            id_choice="2"
+        fi
+    fi
+    
+    if [[ "$id_choice" == "2" ]]; then
+        identity_id=""
+        username=$(prompt_input "  Username" "$USER")
+        
+        printf "\n  ${BOLD}1${RST}  Key authentication\n"
+        printf "  ${BOLD}2${RST}  Password authentication\n\n"
+        
+        local auth_choice
+        auth_choice=$(prompt_input "  Auth type" "1")
+        
+        if [[ "$auth_choice" == "2" ]]; then
+            auth_type="password"
+            password=$(prompt_input "  Password" "" "secret")
+        else
+            auth_type="key"
+            key_path=$(prompt_input "  Key path" "~/.ssh/id_rsa")
+        fi
+    fi
+    
+    # For identity-based, we still need to store username for display
+    if [[ -n "$identity_id" ]]; then
+        local id_line
+        id_line=$(get_identity "$identity_id")
+        username="${id_line#*:*:}"
+        username="${username%%:*}"
+    fi
+    
+    add_connection "ssh" "$name" "$host" "$port" "$identity_id" "$key_path" "$password" "" "" "$CURRENT_FOLDER"
+    msg_success "Connection added!"
+    sleep 1
 }
+
+# Add serial connection dialog
+add_serial_dialog() {
+    clear_screen
+    print_header
+    printf "\n  ${BOLD}New Serial Connection${RST}\n\n"
+    
+    # List available devices
+    printf "  ${DIM}Available devices:${RST}\n"
+    for dev in /dev/ttyUSB* /dev/ttyACM* /dev/tty.usb* /dev/ttyS[0-3]; do
+        [[ -e "$dev" ]] && printf "    %s\n" "$dev"
+    done
+    printf "\n"
+    
+    local name device baud
+    
+    name=$(prompt_input "  Name")
+    [[ -z "$name" ]] && return
+    
+    device=$(prompt_input "  Device" "/dev/ttyUSB0")
+    baud=$(prompt_input "  Baud rate" "115200")
+    
+    add_connection "serial" "$name" "" "" "" "" "" "$device" "$baud" "$CURRENT_FOLDER"
+    msg_success "Connection added!"
+    sleep 1
+}
+
+# Add connection menu
+add_connection_dialog() {
+    clear_screen
+    print_header
+    printf "\n  ${BOLD}Add Connection${RST}\n\n"
+    printf "  ${BOLD}1${RST}  ${C_SSH}🖥  SSH${RST}\n"
+    printf "  ${BOLD}2${RST}  ${C_SERIAL}📟 Serial${RST}\n"
+    printf "  ${BOLD}0${RST}  Cancel\n\n"
+    
+    local choice
+    choice=$(prompt_input "  Type")
+    
+    case "$choice" in
+        1) add_ssh_dialog ;;
+        2) add_serial_dialog ;;
+    esac
+}
+
+# Add folder dialog
+add_folder_dialog() {
+    clear_screen
+    print_header
+    printf "\n  ${BOLD}New Folder${RST}\n\n"
+    
+    local name
+    name=$(prompt_input "  Folder name")
+    [[ -z "$name" ]] && return
+    
+    # Sanitize name (remove colons which are our delimiter)
+    name="${name//:/}"
+    
+    add_folder "$name" "$CURRENT_FOLDER" >/dev/null
+    msg_success "Folder '$name' created!"
+    pause
+}
+
+# Identity management
+identity_menu() {
+    while true; do
+        local identities=()
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            identities+=("$line")
+        done <<< "${DATA[identities]:-}"
+
+  clear_screen
+        print_header
+        printf "\n  ${BOLD}Identities${RST}\n\n"
+        
+        if [[ ${#identities[@]} -eq 0 ]]; then
+            printf "  ${DIM}No identities defined${RST}\n"
+        else
+            local i=1
+            for id_line in "${identities[@]}"; do
+                local id="${id_line%%:*}"
+                local rest="${id_line#*:}"
+                local name="${rest%%:*}"
+                rest="${rest#*:}"
+                local username="${rest%%:*}"
+                rest="${rest#*:}"
+                local auth_type="${rest%%:*}"
+                printf "  ${BOLD}%d${RST}  ${C_IDENTITY}👤 %s${RST}  ${DIM}%s (%s)${RST}\n" "$i" "$name" "$username" "$auth_type"
+                ((i++))
+            done
+        fi
+        
+        printf "\n"
+        printf "  ${DIM}a${RST} Add  ${DIM}d${RST} Delete  ${DIM}q${RST} Back\n\n"
+        
+        local key
+        key=$(prompt_input "  Action")
+        
+        case "$key" in
+            a|A)
+  clear_screen
+                print_header
+                printf "\n  ${BOLD}New Identity${RST}\n\n"
+                
+                local name username auth_type key_path password
+                name=$(prompt_input "  Identity name")
+                [[ -z "$name" ]] && continue
+                
+                username=$(prompt_input "  Username" "$USER")
+                
+                printf "\n  ${BOLD}1${RST}  Key authentication\n"
+                printf "  ${BOLD}2${RST}  Password authentication\n\n"
+                
+                local auth_choice
+                auth_choice=$(prompt_input "  Auth type" "1")
+                
+                if [[ "$auth_choice" == "2" ]]; then
+                    auth_type="password"
+                    password=$(prompt_input "  Password" "" "secret")
+                else
+                    auth_type="key"
+                    key_path=$(prompt_input "  Key path" "~/.ssh/id_rsa")
+                fi
+                
+                add_identity "$name" "$username" "$auth_type" "$key_path" "$password"
+                msg_success "Identity created!"
+                sleep 1
+                ;;
+            d|D)
+                if [[ ${#identities[@]} -eq 0 ]]; then
+                    continue
+                fi
+                local del_choice
+                del_choice=$(prompt_input "  Delete # ")
+                if [[ "$del_choice" =~ ^[0-9]+$ ]] && (( del_choice >= 1 && del_choice <= ${#identities[@]} )); then
+                    local del_line="${identities[$((del_choice-1))]}"
+                    local del_id="${del_line%%:*}"
+                    if prompt_confirm "  Delete this identity?" "n"; then
+                        delete_identity "$del_id"
+                        msg_success "Deleted"
+                        sleep 1
+                    fi
+                fi
+                ;;
+            q|Q|"") return ;;
+        esac
+    done
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Connection Execution
+#═══════════════════════════════════════════════════════════════════════════════
+
+do_ssh_connect() {
+    local conn_line="$1"
+    
+    local IFS=':'
+    local -a fields
+    read -ra fields <<< "$conn_line"
+    
+    local id="${fields[0]}"
+    local name="${fields[2]}"
+    local host="${fields[3]}"
+    local port="${fields[4]:-22}"
+    local identity_id="${fields[5]}"
+    local key_path="${fields[6]}"
+    local pass_enc="${fields[7]}"
+    
+    local username="" password="" auth_type="key"
+    
+    # Get credentials from identity or connection
+    if [[ -n "$identity_id" ]]; then
+        local id_line
+        id_line=$(get_identity "$identity_id")
+        if [[ -n "$id_line" ]]; then
+            local rest="${id_line#*:}"  # skip id
+            rest="${rest#*:}"            # skip name
+            username="${rest%%:*}"
+            rest="${rest#*:}"
+            auth_type="${rest%%:*}"
+            rest="${rest#*:}"
+            local id_key="${rest%%:*}"
+            local id_pass_enc="${rest#*:}"
+            
+            [[ -n "$id_key" ]] && key_path="$id_key"
+            [[ -n "$id_pass_enc" ]] && password=$(decrypt_data "$id_pass_enc" "$SESSION_KEY" 2>/dev/null)
+        fi
+    else
+        # Use connection's own credentials
+        [[ -n "$pass_enc" ]] && password=$(decrypt_data "$pass_enc" "$SESSION_KEY" 2>/dev/null)
+        [[ -n "$password" ]] && auth_type="password"
+    fi
+    
+    # Fallback username
+    [[ -z "$username" ]] && username="$USER"
+    
+    # Expand key path
+    [[ -n "$key_path" ]] && key_path="${key_path/#\~/$HOME}"
+    
+    cursor_show
+    clear_screen
+    printf "\n${C_ACCENT}${BOLD}Connecting to %s${RST}\n" "$name"
+    printf "${DIM}%s@%s:%s${RST}\n\n" "$username" "$host" "$port"
+    
+    local -a cmd=(ssh -p "$port")
+    [[ "$auth_type" == "key" && -n "$key_path" && -f "$key_path" ]] && cmd+=(-i "$key_path")
+    cmd+=("${username}@${host}")
+    
+    printf "${DIM}Tip: Type 'exit' or Ctrl+D to return"
+    [[ $HAS_SCREEN -eq 1 ]] && printf " | Ctrl+A,D to detach"
+    printf "${RST}\n\n"
+    
+    if [[ $HAS_SCREEN -eq 1 ]]; then
+        local session="termtrax-${id}"
+        if [[ -n "$password" && $HAS_SSHPASS -eq 1 ]]; then
+            screen -S "$session" sshpass -p "$password" "${cmd[@]}" || true
+        else
+            screen -S "$session" "${cmd[@]}" || true
+        fi
+    else
+        if [[ -n "$password" && $HAS_SSHPASS -eq 1 ]]; then
+            sshpass -p "$password" "${cmd[@]}" || true
+        else
+            "${cmd[@]}" || true
+        fi
+    fi
+    
+    printf "\n${DIM}Connection closed${RST}\n"
+    cursor_hide
+  pause
+}
+
+do_serial_connect() {
+    local conn_line="$1"
+    
+    local IFS=':'
+    local -a fields
+    read -ra fields <<< "$conn_line"
+    
+    local id="${fields[0]}"
+    local name="${fields[2]}"
+    local device="${fields[8]}"
+    local baud="${fields[9]:-115200}"
+    
+    [[ -z "$SERIAL_TOOL" ]] && { msg_error "No serial tool found"; pause; return; }
+    [[ ! -e "$device" ]] && { msg_error "Device $device not found"; pause; return; }
+    
+    cursor_show
+    clear_screen
+    printf "\n${C_ACCENT2}${BOLD}Connecting to %s${RST}\n" "$name"
+    printf "${DIM}%s @%s baud${RST}\n\n" "$device" "$baud"
+    
+    printf "${DIM}Exit: "
+    case "$SERIAL_TOOL" in
+        screen)  printf "Ctrl+A,K (kill) or Ctrl+A,D (detach)" ;;
+        tio)     printf "Ctrl+T then Q" ;;
+        picocom) printf "Ctrl+A then Ctrl+X" ;;
+        minicom) printf "Ctrl+A then Z then X" ;;
+    esac
+    printf "${RST}\n\n"
+    
+    case "$SERIAL_TOOL" in
+        screen)  screen -S "termtrax-serial-${id}" "$device" "$baud" || true ;;
+        tio)     tio -b "$baud" "$device" || true ;;
+        picocom) picocom -b "$baud" "$device" || true ;;
+        minicom) minicom -b "$baud" -D "$device" || true ;;
+    esac
+    
+    printf "\n${DIM}Connection closed${RST}\n"
+    cursor_hide
+    pause
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Session Reattach (for detached screen sessions)
+#═══════════════════════════════════════════════════════════════════════════════
 
 reattach_menu() {
-  while true; do
+    [[ $HAS_SCREEN -eq 0 ]] && { msg_warn "screen not installed"; pause; return; }
+    
     clear_screen
-    print_header "TermTrax: Reattach Sessions"
-    echo "1) SSH screen sessions"
-    echo "2) Serial screen sessions"
-    echo "3) All TermTrax screen sessions"
-    echo "4) Back"
+    print_header
+    printf "\n  ${BOLD}Detached Sessions${RST}\n\n"
+    
+    local sessions=()
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == *"termtrax-"* ]] && sessions+=("$line")
+    done < <(screen -ls 2>/dev/null | grep -oE '[0-9]+\.termtrax-[^[:space:]]+' || true)
+    
+    if [[ ${#sessions[@]} -eq 0 ]]; then
+        printf "  ${DIM}No detached sessions${RST}\n"
+        pause
+        return
+    fi
+    
+    local i=1
+    for sess in "${sessions[@]}"; do
+        printf "  ${BOLD}%d${RST}  %s\n" "$i" "$sess"
+        ((i++))
+    done
+    
+    printf "\n"
     local choice
-    read -r -p "Select option: " choice || true
-    case "$choice" in
-      1) screen_sessions_menu "ssh" ;;
-      2) screen_sessions_menu "serial" ;;
-      3) screen_sessions_menu "all" ;;
-      4) return 0 ;;
-      *) echo "Invalid selection."; pause ;;
-    esac
-  done
+    choice=$(prompt_input "  Session # to attach (0 to cancel)")
+    
+    [[ -z "$choice" || "$choice" == "0" ]] && return
+    
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
+        local session="${sessions[$((choice-1))]}"
+        cursor_show
+        # Use -d -r to force detach from other terminals first
+        screen -d -r "$session" || true
+        cursor_hide
+    else
+        msg_error "Invalid selection"
+        pause
+    fi
 }
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Import Functions
+#═══════════════════════════════════════════════════════════════════════════════
+
+# Import from Termius JSON export (with folder support)
+import_termius() {
+    local file="$1"
+    
+    if ! command -v python3 >/dev/null 2>&1; then
+        msg_error "python3 required for Termius import"
+        return 1
+    fi
+    
+    # Python script to parse Termius JSON and output in our format
+    local parser
+    parser=$(cat << 'PYTHON'
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except:
+    sys.exit(1)
+
+# Get groups (folders) - Termius calls them "groups"
+groups = {}
+for g in data.get("groups", data.get("Groups", [])):
+    gid = g.get("id", g.get("Id", ""))
+    name = g.get("label", g.get("Label", g.get("name", "")))
+    parent = g.get("group_id", g.get("parent_id", ""))
+    if gid and name:
+        groups[gid] = {"name": name, "parent": parent}
+        print(f"FOLDER|{gid}|{name}|{parent}")
+
+# Get hosts
+for h in data.get("hosts", data.get("Hosts", [])):
+    label = h.get("label", h.get("Label", ""))
+    addr = h.get("address", h.get("Address", ""))
+    port = h.get("port", h.get("Port", 22))
+    user = h.get("username", h.get("Username", ""))
+    group_id = h.get("group_id", h.get("group", ""))
+    if addr:
+        print(f"HOST|{label}|{addr}|{port}|{user}|{group_id}")
+PYTHON
+)
+    
+    local count_folders=0 count_hosts=0
+    declare -A folder_map  # Maps Termius folder ID to our folder ID
+    
+    local line
+    while IFS='|' read -r type arg1 arg2 arg3 arg4 arg5; do
+        [[ -z "$type" ]] && continue
+        
+        if [[ "$type" == "FOLDER" ]]; then
+            local termius_id="$arg1"
+            local name="$arg2"
+            local parent_termius="$arg3"
+            
+            # Find parent in our system
+            local parent_id=""
+            [[ -n "$parent_termius" && -n "${folder_map[$parent_termius]:-}" ]] && parent_id="${folder_map[$parent_termius]}"
+            
+            # Create folder
+            local new_id
+            new_id=$(add_folder "$name" "$parent_id")
+            folder_map[$termius_id]="$new_id"
+            ((count_folders++))
+            
+        elif [[ "$type" == "HOST" ]]; then
+            local name="$arg1"
+            local host="$arg2"
+            local port="$arg3"
+            local user="$arg4"
+            local group_termius="$arg5"
+            
+            [[ -z "$host" ]] && continue
+            [[ -z "$name" ]] && name="$host"
+            [[ -z "$user" ]] && user="$USER"
+            [[ -z "$port" ]] && port="22"
+            
+            # Find folder
+            local folder_id=""
+            [[ -n "$group_termius" && -n "${folder_map[$group_termius]:-}" ]] && folder_id="${folder_map[$group_termius]}"
+            
+            # Create connection
+            add_connection "ssh" "$name" "$host" "$port" "" "" "" "" "" "$folder_id"
+            ((count_hosts++))
+        fi
+    done < <(python3 -c "$parser" < "$file" 2>/dev/null)
+    
+    if (( count_hosts > 0 || count_folders > 0 )); then
+        msg_success "Imported $count_hosts hosts and $count_folders folders from Termius"
+    return 0
+    else
+        msg_error "No data found in Termius export"
+        return 1
+    fi
+}
+
+# Import from CSV (name,host,port,user)
+import_csv() {
+    local file="$1"
+    local count=0
+    local line
+    
+    while IFS=',' read -r name host port user _; do
+        [[ -z "$host" || "$name" == "name" ]] && continue
+        [[ -z "$name" ]] && name="$host"
+        [[ -z "$user" ]] && user="$USER"
+        [[ -z "$port" ]] && port="22"
+        
+        add_connection "ssh" "$name" "$host" "$port" "" "" "" "" "" "$CURRENT_FOLDER"
+        ((count++))
+    done < "$file"
+    
+    if (( count > 0 )); then
+        msg_success "Imported $count connections from CSV"
+        return 0
+    else
+        msg_error "No connections found in CSV"
+        return 1
+    fi
+}
+
+import_menu() {
+    clear_screen
+    print_header
+    printf "\n  ${BOLD}Import Connections${RST}\n\n"
+    printf "  ${BOLD}1${RST}  Import from Termius (JSON export)\n"
+    printf "  ${BOLD}2${RST}  Import from CSV (name,host,port,user)\n"
+    printf "  ${BOLD}0${RST}  Back\n\n"
+    printf "  ${DIM}Termius export: Settings → Export → JSON${RST}\n"
+    printf "  ${DIM}Folders from Termius will be recreated here${RST}\n\n"
+    
+    local choice
+    choice=$(prompt_input "  Option")
+    
+    case "$choice" in
+        1)
+            local path
+            path=$(prompt_input "  Termius JSON file")
+            [[ -z "$path" ]] && return
+            path="${path/#\~/$HOME}"
+            if [[ -f "$path" ]]; then
+                import_termius "$path"
+            else
+                msg_error "File not found: $path"
+            fi
+            pause
+            ;;
+        2)
+            local path
+            path=$(prompt_input "  CSV file")
+            [[ -z "$path" ]] && return
+            path="${path/#\~/$HOME}"
+            if [[ -f "$path" ]]; then
+                import_csv "$path"
+            else
+                msg_error "File not found: $path"
+            fi
+            pause
+            ;;
+        0|"") return ;;
+    esac
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# Settings
+#═══════════════════════════════════════════════════════════════════════════════
 
 settings_menu() {
   while true; do
     clear_screen
-    print_header "TermTrax: Settings"
-    echo "1) Set default serial baud (current: $DEFAULT_BAUD)"
-    echo "2) Reset vault"
-    echo "3) Reattach sessions"
-    echo "4) Back"
+        print_header
+        printf "\n  ${BOLD}Settings${RST}\n\n"
+        printf "  ${BOLD}1${RST}  Import from Termius/CSV\n"
+        printf "  ${BOLD}2${RST}  Export data\n"
+        printf "  ${BOLD}3${RST}  Lock vault\n"
+        printf "  ${BOLD}4${RST}  Change master password\n"
+        printf "  ${BOLD}5${RST}  About\n"
+        printf "  ${BOLD}0${RST}  Back\n\n"
+        
     local choice
-    read -r -p "Select option: " choice || true
+        choice=$(prompt_input "  Option")
+        
     case "$choice" in
       1)
-        local baud
-        baud="$(prompt_required "Default baud rate")"
-        DEFAULT_BAUD="$baud"
-        save_settings
-        echo "Default baud set to $DEFAULT_BAUD."
-        pause
-        ;;
-      2)
-        reset_vault
+                import_menu
+                ;;
+            2)
+                local path
+                path=$(prompt_input "  Export to" "./termtrax-backup.enc")
+                if [[ -n "$path" ]]; then
+                    cp "$DB_FILE" "$path" && msg_success "Exported to $path" || msg_error "Export failed"
+                fi
         pause
         ;;
       3)
-        reattach_menu
-        ;;
-      4) return 0 ;;
-      *) echo "Invalid selection."; pause ;;
+                vault_lock
+                return
+                ;;
+            4)
+                printf "\n"
+                local old_pw new_pw1 new_pw2
+                old_pw=$(prompt_input "  Current password" "" "secret")
+                if [[ "$old_pw" != "$VAULT_MASTER" ]]; then
+                    msg_error "Wrong password"
+                    pause
+                    continue
+                fi
+                new_pw1=$(prompt_input "  New password" "" "secret")
+                new_pw2=$(prompt_input "  Confirm new password" "" "secret")
+                if [[ "$new_pw1" != "$new_pw2" ]]; then
+                    msg_error "Passwords don't match"
+                    pause
+                    continue
+                fi
+                
+                VAULT_MASTER="$new_pw1"
+                SESSION_KEY=$(derive_session_key "$VAULT_MASTER")
+                save_data
+                save_session
+                msg_success "Password changed!"
+                pause
+                ;;
+            5)
+                printf "\n"
+                printf "  ${BOLD}TermTrax${RST} v%s\n" "$VERSION"
+                printf "  SSH & Serial Connection Manager\n\n"
+                printf "  Config: %s\n" "$CONFIG_DIR"
+                printf "  Screen: %s\n" "$([[ $HAS_SCREEN -eq 1 ]] && echo "available" || echo "not found")"
+                printf "  Serial: %s\n" "${SERIAL_TOOL:-none}"
+                pause
+                ;;
+            0|"") return ;;
     esac
   done
 }
 
-connection_list_menu() {
-  clear_screen
-  print_header "TermTrax: Connections"
-  load_connections
-  list_connections
-  pause
+#═══════════════════════════════════════════════════════════════════════════════
+# Main Loop
+#═══════════════════════════════════════════════════════════════════════════════
+
+check_dependencies() {
+    if ! command -v openssl >/dev/null 2>&1; then
+        printf "${RED}Error: openssl is required for encryption${RST}\n"
+        exit 1
+    fi
+    
+    command -v ssh >/dev/null 2>&1 || msg_warn "ssh not found"
+    command -v screen >/dev/null 2>&1 && HAS_SCREEN=1
+    command -v sshpass >/dev/null 2>&1 && HAS_SSHPASS=1
+    
+    for tool in screen tio picocom minicom; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            SERIAL_TOOL="$tool"
+            break
+        fi
+    done
 }
 
-main_menu() {
+main_loop() {
+    cursor_hide
+    trap 'cursor_show; clear_screen' EXIT
+    
   while true; do
-    clear_screen
-    print_header "$APP_NAME"
-    echo "1) List connections"
-    echo "2) Add connection"
-    echo "3) Edit connection"
-    echo "4) Delete connection"
-    echo "5) Connect"
-    echo "6) Export/import config"
-    echo "7) Settings"
-    echo "8) Quit"
-    local choice
-    read -r -p "Select option: " choice || true
-    case "$choice" in
-      1) connection_list_menu ;;
-      2) connection_add ;;
-      3) connection_edit ;;
-      4) connection_delete ;;
-      5) connection_connect ;;
-      6) export_import_menu ;;
-      7) settings_menu ;;
-      8) echo "Goodbye."; exit 0 ;;
-      *) echo "Invalid selection."; pause ;;
+        build_menu
+        render_menu
+        
+        local key
+        key=$(read_key)
+        
+        case "$key" in
+            UP)
+                (( MENU_SELECTED > 0 )) && ((MENU_SELECTED--))
+                ;;
+            DOWN)
+                (( MENU_SELECTED < ${#MENU_ITEMS[@]} - 1 )) && ((MENU_SELECTED++))
+                ;;
+            HOME)
+                MENU_SELECTED=0
+                ;;
+            END)
+                MENU_SELECTED=$(( ${#MENU_ITEMS[@]} - 1 ))
+                ;;
+            PGUP)
+                MENU_SELECTED=$(( MENU_SELECTED - 10 ))
+                (( MENU_SELECTED < 0 )) && MENU_SELECTED=0
+                ;;
+            PGDN)
+                MENU_SELECTED=$(( MENU_SELECTED + 10 ))
+                (( MENU_SELECTED >= ${#MENU_ITEMS[@]} )) && MENU_SELECTED=$(( ${#MENU_ITEMS[@]} - 1 ))
+                ;;
+            ENTER|CONNECT|RIGHT)
+                local selected_id="${MENU_IDS[$MENU_SELECTED]:-}"
+                case "$selected_id" in
+                    PARENT)
+                        # Go up to parent folder
+                        if [[ -n "$CURRENT_FOLDER" ]]; then
+                            local folder_line
+                            folder_line=$(get_folder_by_id "$CURRENT_FOLDER")
+                            if [[ -n "$folder_line" ]]; then
+                                local parent="${folder_line##*:}"
+                                CURRENT_FOLDER="$parent"
+                            else
+                                CURRENT_FOLDER=""
+                            fi
+                        fi
+                        MENU_SELECTED=0
+                        ;;
+                    F:*)
+                        # Enter folder
+                        CURRENT_FOLDER="${selected_id#F:}"
+                        MENU_SELECTED=0
+                        ;;
+                    C:*)
+                        # Connect
+                        local conn_id="${selected_id#C:}"
+                        local conn_line
+                        conn_line=$(get_connection "$conn_id")
+                        if [[ -n "$conn_line" ]]; then
+                            local conn_type="${conn_line#*:}"
+                            conn_type="${conn_type%%:*}"
+                            if [[ "$conn_type" == "ssh" ]]; then
+                                do_ssh_connect "$conn_line"
+                            else
+                                do_serial_connect "$conn_line"
+                            fi
+                        fi
+                        ;;
+                esac
+                ;;
+            ESC|LEFT)
+                if [[ -n "$CURRENT_FOLDER" ]]; then
+                    # Go up
+                    local folder_line
+                    folder_line=$(get_folder_by_id "$CURRENT_FOLDER")
+                    if [[ -n "$folder_line" ]]; then
+                        local parent="${folder_line##*:}"
+                        CURRENT_FOLDER="$parent"
+                    else
+                        CURRENT_FOLDER=""
+                    fi
+                    MENU_SELECTED=0
+                else
+                    # At root, quit
+                    if prompt_confirm "Quit TermTrax?" "y"; then
+                        break
+                    fi
+                fi
+                ;;
+            ADD)
+                add_connection_dialog
+                ;;
+            NEW_FOLDER)
+                add_folder_dialog
+                ;;
+            IDENTITY)
+                identity_menu
+                ;;
+            DELETE)
+                local selected_id="${MENU_IDS[$MENU_SELECTED]:-}"
+                case "$selected_id" in
+                    F:*)
+                        if prompt_confirm "Delete this folder and all contents?" "n"; then
+                            delete_folder "${selected_id#F:}"
+                            MENU_SELECTED=0
+                        fi
+                        ;;
+                    C:*)
+                        if prompt_confirm "Delete this connection?" "n"; then
+                            delete_connection "${selected_id#C:}"
+                            MENU_SELECTED=0
+                        fi
+                        ;;
+                esac
+                ;;
+            SETTINGS)
+                settings_menu
+                ;;
+            REATTACH)
+                [[ $HAS_SCREEN -eq 1 ]] && reattach_menu
+                ;;
+            HELP|'?')
+                clear_screen
+                print_header
+                printf "\n  ${BOLD}Keyboard Shortcuts${RST}\n\n"
+                printf "  ${BOLD}↑/↓${RST}      Navigate up/down\n"
+                printf "  ${BOLD}Enter${RST}    Select / Connect\n"
+                printf "  ${BOLD}←/q${RST}      Go back / Quit\n"
+                printf "  ${BOLD}→${RST}        Enter folder / Connect\n"
+                printf "  ${BOLD}a${RST}        Add connection\n"
+                printf "  ${BOLD}n${RST}        New folder\n"
+                printf "  ${BOLD}d${RST}        Delete selected\n"
+                printf "  ${BOLD}i${RST}        Manage identities\n"
+                printf "  ${BOLD}r${RST}        Reattach detached session\n"
+                printf "  ${BOLD}s${RST}        Settings\n"
+                printf "  ${BOLD}?${RST}        This help\n"
+                pause
+                ;;
     esac
   done
+}
+
+print_help() {
+    cat << EOF
+${BOLD}TermTrax${RST} v$VERSION - SSH & Serial Connection Manager
+
+${BOLD}USAGE${RST}
+    termtrax [OPTIONS]
+
+${BOLD}OPTIONS${RST}
+    -h, --help      Show this help
+    -v, --version   Show version
+    --reset         Delete all data and start fresh
+
+${BOLD}FEATURES${RST}
+    • Full encryption at rest (AES-256)
+    • Persistent login (machine-bound session token)
+    • Identity profiles for reusable credentials
+    • Folder organization
+    • Arrow key navigation
+
+${BOLD}NAVIGATION${RST}
+    ↑/↓         Move selection
+    Enter/→     Select / Enter folder / Connect
+    ←/q/Esc     Go back / Quit
+    a           Add connection
+    n           New folder
+    d           Delete
+    i           Manage identities
+    s           Settings
+
+EOF
 }
 
 main() {
-  if [[ "${1-}" == "--help" || "${1-}" == "-h" ]]; then
-    print_help
+    case "${1:-}" in
+        -h|--help) print_help; exit 0 ;;
+        -v|--version) echo "TermTrax v$VERSION"; exit 0 ;;
+        --reset)
+            rm -rf "$CONFIG_DIR" "$SESSION_FILE"
+            echo "Data reset."
     exit 0
-  fi
-  if ! command -v ssh >/dev/null 2>&1; then
-    echo "Warning: ssh not found. SSH connections will not work."
-  fi
-  if ! command -v openssl >/dev/null 2>&1; then
-    VAULT_ENABLED=0
-  fi
-  ensure_config_dir
-  load_settings
-  config_init
-  main_menu
+            ;;
+    esac
+    
+    check_dependencies
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    
+    vault_unlock
+    main_loop
+    
+    cursor_show
+    clear_screen
+    printf "${DIM}Goodbye!${RST}\n"
 }
 
 main "$@"
-
-# Install:
-#   chmod +x termtrax
-#   mv termtrax ~/bin/termtrax  (or /usr/local/bin/termtrax)
-#
-# Examples:
-#   termtrax
-#   Add SSH: Name=web01, Host=10.0.0.5, User=pi, Port=22, Auth=key
-#   Add serial: Name=router-console, Device=/dev/ttyUSB0, Baud=115200
-#   Detach screen: Ctrl+A, D then reattach via Settings -> Reattach sessions
