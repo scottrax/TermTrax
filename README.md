@@ -19,6 +19,13 @@ TermTrax is an ultra lightweight terminal-only SSH and serial connection manager
 
 ## Install
 
+Clone it with SSH:
+
+```bash
+git clone git@github.com:scottrax/TermTrax.git
+cd TermTrax
+```
+
 ```bash
 chmod +x termtrax
 mv termtrax ~/bin/termtrax
