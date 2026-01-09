@@ -523,13 +523,13 @@ delete_identity() {
     save_data
 }
 
-# Connections: "id:type:name:host:port:identity_id:key_path:password_enc:device:baud:folder_id"
+# Connections: "id:type:name:host:port:identity_id:key_path:password_enc:device:baud:folder_id:username"
 get_connections() {
     printf '%s' "${DATA[connections]:-}"
 }
 
 add_connection() {
-    local type="$1" name="$2" host="$3" port="$4" identity_id="$5" key_path="$6" password="$7" device="$8" baud="$9" folder_id="${10:-}"
+    local type="$1" name="$2" host="$3" port="$4" identity_id="$5" key_path="$6" password="$7" device="$8" baud="$9" folder_id="${10:-}" username="${11:-}"
     local id
     id=$(gen_id)
     
@@ -538,7 +538,7 @@ add_connection() {
     
     local conns="${DATA[connections]:-}"
     [[ -n "$conns" ]] && conns+=$'\n'
-    conns+="${id}:${type}:${name}:${host}:${port}:${identity_id}:${key_path}:${pass_enc}:${device}:${baud}:${folder_id}"
+    conns+="${id}:${type}:${name}:${host}:${port}:${identity_id}:${key_path}:${pass_enc}:${device}:${baud}:${folder_id}:${username}"
     DATA[connections]="$conns"
     save_data
     printf '%s' "$id"
@@ -790,11 +790,11 @@ select_identity() {
         return
     fi
 
-  clear_screen
-    print_header
-    printf "\n  ${BOLD}Select Identity${RST}\n\n"
+    clear_screen >&2
+    print_header >&2
+    printf "\n  ${BOLD}Select Identity${RST}\n\n" >&2
     
-    printf "  ${DIM}0${RST}  (none - enter manually)\n"
+    printf "  ${DIM}0${RST}  (none - enter manually)\n" >&2
     local i=1
     for id_line in "${identities[@]}"; do
         local id="${id_line%%:*}"
@@ -802,11 +802,11 @@ select_identity() {
         local name="${rest%%:*}"
         rest="${rest#*:}"
         local username="${rest%%:*}"
-        printf "  ${BOLD}%d${RST}  ${C_IDENTITY}👤 %s${RST} ${DIM}(%s)${RST}\n" "$i" "$name" "$username"
+        printf "  ${BOLD}%d${RST}  ${C_IDENTITY}👤 %s${RST} ${DIM}(%s)${RST}\n" "$i" "$name" "$username" >&2
         ((i++))
     done
     
-    printf "\n"
+    printf "\n" >&2
     local choice
     choice=$(prompt_input "Select" "0")
     
@@ -878,7 +878,7 @@ add_ssh_dialog() {
         username="${username%%:*}"
     fi
     
-    add_connection "ssh" "$name" "$host" "$port" "$identity_id" "$key_path" "$password" "" "" "$CURRENT_FOLDER"
+    add_connection "ssh" "$name" "$host" "$port" "$identity_id" "$key_path" "$password" "" "" "$CURRENT_FOLDER" "$username"
     msg_success "Connection added!"
     sleep 1
 }
@@ -1051,8 +1051,9 @@ do_ssh_connect() {
     local identity_id="${fields[5]}"
     local key_path="${fields[6]}"
     local pass_enc="${fields[7]}"
+    local stored_user="${fields[11]:-}"
     
-    local username="" password="" auth_type="key"
+    local username="$stored_user" password="" auth_type="key"
     
     # Get credentials from identity or connection
     if [[ -n "$identity_id" ]]; then
@@ -1289,7 +1290,7 @@ PYTHON
             [[ -n "$group_termius" && -n "${folder_map[$group_termius]:-}" ]] && folder_id="${folder_map[$group_termius]}"
             
             # Create connection
-            add_connection "ssh" "$name" "$host" "$port" "" "" "" "" "" "$folder_id"
+            add_connection "ssh" "$name" "$host" "$port" "" "" "" "" "" "$folder_id" "$user"
             ((count_hosts++))
         fi
     done < <(python3 -c "$parser" < "$file" 2>/dev/null)
@@ -1315,7 +1316,7 @@ import_csv() {
         [[ -z "$user" ]] && user="$USER"
         [[ -z "$port" ]] && port="22"
         
-        add_connection "ssh" "$name" "$host" "$port" "" "" "" "" "" "$CURRENT_FOLDER"
+        add_connection "ssh" "$name" "$host" "$port" "" "" "" "" "" "$CURRENT_FOLDER" "$user"
         ((count++))
     done < "$file"
     
